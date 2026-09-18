@@ -1,0 +1,40 @@
+# секреты и локальные данные — никогда не в git
+.env
+.env.*
+!.env.example
+*.env.local
+*-secrets.*
+*login*.md
+*password*
+*credentials*
+data/
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# редакторы / ОС
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# артефакты живых прогонов
+reports/
+playwright-report/

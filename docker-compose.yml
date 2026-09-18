@@ -1,0 +1,24 @@
+# Запуск:  docker compose up --build   →  http://localhost:8000
+# Перед запуском: cp .env.example .env и впишите KEITARO_BASE_URL и KEITARO_API_KEY.
+services:
+  adrobot:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: sqlite+aiosqlite:////app/data/adrobot.sqlite3
+    ports:
+      # Наружу только на localhost. Открываете в сеть — задайте ADROBOT_AUTH_TOKEN.
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - adrobot-data:/app/data
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  adrobot-data:
