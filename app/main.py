@@ -106,7 +106,12 @@ def create_app(
         lifespan=lifespan,
         docs_url=None,  # свою страницу /docs отдаём ниже: со скриптами из репозитория, без CDN
         redoc_url=None,
-        root_path=settings.root_path.rstrip("/"),
+        # ROOT_PATH не отдаём в маршрутизацию намеренно. Прокси уже отрезал префикс, и адреса
+        # приходят без него. Starlette при заданном root_path ломает примонтированные каталоги:
+        # StaticFiles начинает искать файл на уровень глубже, и вся статика отвечает 404.
+        # Префикс нужен ровно в одном месте — чтобы кнопка Try it out в Swagger UI била по
+        # верным адресам. Для этого хватает записи servers в схеме.
+        servers=([{"url": prefix}] if (prefix := settings.root_path.rstrip("/")) else None),
     )
 
     allowed_hosts = [host.strip() for host in settings.allowed_hosts.split(",") if host.strip()]

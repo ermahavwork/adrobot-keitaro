@@ -289,7 +289,12 @@ class TestSubPathDeployment:
         text = (self.WEB / "static" / "js" / "api.js").read_text(encoding="utf-8")
         assert 'new URL(".", document.baseURI).pathname' in text
 
-    def test_swagger_knows_the_prefix(self, tmp_path, fake):
+    def test_swagger_knows_the_prefix_and_files_still_load(self, tmp_path, fake):
+        """Регрессия: с ROOT_PATH вся статика отвечала 404, и интерфейс открывался без стилей.
+
+        Starlette при заданном `root_path` считает, что префикс придёт в адресе запроса. Прокси
+        его уже отрезал, поэтому примонтированный каталог искал файлы на уровень глубже.
+        """
         settings = make_settings(tmp_path, root_path="/adrobot/")
         _create_schema(settings.database_url)
         db.override_engine(db.create_engine(settings.database_url))
@@ -300,6 +305,9 @@ class TestSubPathDeployment:
                 assert '"openapi.json"' in docs or "'openapi.json'" in docs
                 assert 'src="static/vendor/swagger-ui/' in docs and 'href="static/vendor/swagger-ui/' in docs
                 assert prefixed.get("/api/auth/mode").status_code == 200, "сам API префикса не требует"
+                for path in ("/", "/static/js/app.js", "/static/css/app.css",
+                             "/static/js/views/editor.js", "/static/vendor/swagger-ui/swagger-ui.css"):
+                    assert prefixed.get(path).status_code == 200, path
         finally:
             engine = db.get_engine()
             db.override_engine(None)
