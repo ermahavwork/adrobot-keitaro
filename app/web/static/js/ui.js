@@ -25,7 +25,10 @@ export function reportError(error) {
 
 /** Кнопка на время операции блокируется и показывает индикатор — защита от двойного клика. */
 export async function withBusy(button, task) {
-  if (!button || button.disabled) return undefined;
+  // Кнопки может и не быть (ручной ввод доли, вызов из диалога) — задача выполняется всё равно.
+  // Пропускаем её только при повторном клике по уже занятой кнопке.
+  if (!button) return task();
+  if (button.disabled) return undefined;
   button.disabled = true;
   button.classList.add("btn--busy");
   try {
@@ -55,10 +58,13 @@ export function dialog({ title, body, actions, wide = false }) {
     const buttons = actions.map((action) => h("button", {
       class: ["btn", action.kind ? `btn--${action.kind}` : ""], onclick: () => close(action.value),
     }, action.label));
+    // body может быть функцией (close) => узлы: так содержимое диалога умеет закрыть его само,
+    // и при этом снимаются слушатели и возвращается фокус (а не просто удаляется узел из DOM).
+    const content = typeof body === "function" ? body(close) : body;
     const modal = h("div", { class: ["modal", wide ? "modal--wide" : ""], role: "dialog",
       "aria-modal": "true", "aria-label": title },
     h("div", { class: "modal__head" }, h("h2", {}, title)),
-    h("div", { class: "modal__body" }, body),
+    h("div", { class: "modal__body" }, content),
     h("div", { class: "modal__foot" }, buttons));
     const backdrop = h("div", { class: "modal-backdrop",
       onmousedown: (event) => { if (event.target === backdrop) close(null); } }, modal);

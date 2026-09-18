@@ -43,9 +43,24 @@ async def audited(session: AsyncSession, action: str, **ids: int | None):
                                    details=info["details"],
                                    duration_ms=int((perf_counter() - started) * 1000), **ids)
         raise
-    await audit.record(session, action, summary=info["summary"], details=info["details"],
+    if info.get("skip"):
+        return
+    # Операция может завершиться без исключения и всё же неудачно (создание: «создано 0, ошибок 1»).
+    await audit.record(session, action, status=info.get("status", "ok"), error=info.get("error"),
+                       summary=info["summary"], details=info["details"],
                        duration_ms=int((perf_counter() - started) * 1000), **ids)
     await session.commit()
+
+
+async def load_offer_names(session: AsyncSession, dictionaries: DictionaryService) -> None:
+    """Подгружает справочник офферов там, где и так идём в Keitaro (импорт, Fetch, синхронизация).
+
+    Кампания отдаётся редактору «из базы, без сети». Если к этому моменту справочник ни разу не
+    загружали, редактор пометил бы каждый оффер «нет в справочнике», хотя оффер на месте.
+    Обновление не принудительное: свежий справочник (DICTIONARY_TTL_SECONDS) повторно не качаем.
+    """
+    with suppress(KeitaroError):  # названия офферов — не повод ронять основную операцию
+        await dictionaries.refresh_offers(session)
 
 
 # SQL-двойник свойства StreamOffer.is_dirty — чтобы находить кампании с черновиками запросом.
@@ -61,8 +76,8 @@ async def campaign_view(session: AsyncSession, campaign: Campaign,
                         dictionaries: DictionaryService, settings: Settings) -> dict[str, Any]:
     offer_ids = {b.offer_id for s in campaign.streams for b in s.bindings}
     offers = await dictionaries.get_offers_map(session, offer_ids)
-    defaults = await dictionaries.resolve_defaults(session)
-    tracking = str(defaults.get("tracking_domain_url") or "").rstrip("/")
+    # Без resolve_defaults: тому нужны справочники Keitaro, а кампания отдаётся «из базы, без сети».
+    tracking = await dictionaries.tracking_domain_url(session)
     streams = [editor.stream_view(s, offers) for s in campaign.streams]
     return {
         "id": campaign.id,
@@ -114,11 +129,13 @@ async def list_campaigns(
 
 
 @router.post("/import", summary="Подтянуть список кампаний из Keitaro")
-async def import_campaigns(session: SessionDep, client: ClientDep) -> dict[str, int]:
+async def import_campaigns(session: SessionDep, client: ClientDep,
+                           dictionaries: DictionariesDep) -> dict[str, int]:
     async with audited(session, "import_campaigns") as info:
         result = await editor.import_campaigns(session, client)
         info["summary"] = (f"кампаний в Keitaro: {result['total']}, новых: {result['created']}, "
                            f"пропало: {result['gone']}")
+    await load_offer_names(session, dictionaries)
     return result
 
 
@@ -136,6 +153,9 @@ async def create_campaign(
         created = [r for r in result["results"] if r["status"] == "created"]
         failed = [r for r in result["results"] if r["status"] == "error"]
         info["details"]["keitaro_campaign_ids"] = [r["keitaro_campaign_id"] for r in created]
+        if failed and not created:
+            info["status"] = "error"
+            info["error"] = "; ".join(f"{r['name']}: {r['error']['message']}" for r in failed)[:2000]
         info["summary"] = (
             f"«{body.name}»: план из {len(result['results'])} кампаний" if body.dry_run else
             f"«{body.name}»: создано {len(created)}, ошибок {len(failed)}"
@@ -144,9 +164,12 @@ async def create_campaign(
 
 
 @router.post("/open/{keitaro_id}", summary="Открыть в редакторе кампанию Keitaro по её ID")
-async def open_campaign(keitaro_id: int, session: SessionDep, client: ClientDep) -> dict[str, int]:
+async def open_campaign(keitaro_id: int, session: SessionDep, client: ClientDep,
+                        dictionaries: DictionariesDep) -> dict[str, int]:
     campaign = await editor.get_or_import_campaign(session, client, keitaro_id)
-    return {"id": campaign.id, "keitaro_id": campaign.keitaro_id}
+    opened = {"id": campaign.id, "keitaro_id": campaign.keitaro_id}
+    await load_offer_names(session, dictionaries)
+    return opened
 
 
 @router.get("/{campaign_id}", summary="Кампания с потоками и офферами (из базы, без сети)")
@@ -168,12 +191,14 @@ async def fetch_streams(campaign_id: int, session: SessionDep, client: ClientDep
                            keitaro_campaign_id=campaign.keitaro_id) as info:
             result = await editor.fetch_streams(session, client, campaign,
                                                 discard_draft=body.discard_draft)
+            # Редактор сам перечитывает кампанию при открытии. Если в Keitaro ничего не поменялось,
+            # такая запись в журнале — шум: оставляем только ручные Fetch и те, что что-то изменили.
+            info["skip"] = body.auto and not result["changed"]
             info["details"] = result
             info["summary"] = (f"потоков: {result['streams']}, ушло в архив офферов: "
                                f"{len(result['archived_offers'])}"
                                + (", черновик сброшен" if body.discard_draft else ""))
-        with suppress(KeitaroError):  # названия офферов — не повод ронять Fetch
-            await dictionaries.refresh_offers(session)
+        await load_offer_names(session, dictionaries)
         campaign = await editor.load_campaign(session, campaign_id)
         view = await campaign_view(session, campaign, dictionaries, settings)
     return {"result": result, "campaign": view}

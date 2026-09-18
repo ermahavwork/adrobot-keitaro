@@ -15,6 +15,9 @@ _SECRET_PATTERNS = [
     re.compile(r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?(?:bearer\s+)?)([^\"'\s,;&}]+)"),
 ]
 
+# Traceback собираем тем же способом, что и стандартный форматтер, — в логе он выглядит привычно.
+_TRACEBACK_FORMATTER = logging.Formatter()
+
 
 class SecretRedactingFilter(logging.Filter):
     """Заменяет известные секреты и похожие на секреты пары ключ=значение."""
@@ -30,7 +33,26 @@ class SecretRedactingFilter(logging.Filter):
             text = pattern.sub(r"\1***", text)
         return text
 
+    def _redact_traceback(self, record: logging.LogRecord) -> None:
+        """Текст исключения и стек форматтер дописывает ПОСЛЕ фильтра — готовим и чистим их заранее.
+
+        Форматтер берёт готовый `exc_text`, если он уже есть, так что в лог уйдёт очищенный текст.
+        """
+        try:
+            if record.exc_info and not record.exc_text:
+                record.exc_text = _TRACEBACK_FORMATTER.formatException(record.exc_info)
+            if record.exc_text:
+                record.exc_text = self.redact(record.exc_text)
+            if record.stack_info:
+                record.stack_info = self.redact(record.stack_info)
+        except Exception:
+            # Сбой вычистки не должен ронять логирование, но и печатать непроверенный traceback
+            # нельзя: лучше потерять подробности, чем показать секрет.
+            record.exc_info, record.stack_info = None, None
+            record.exc_text = "(traceback скрыт: не удалось проверить его на секреты)"
+
     def filter(self, record: logging.LogRecord) -> bool:
+        self._redact_traceback(record)
         try:
             message = record.getMessage()
         except Exception:  # кривой формат лог-записи не должен ронять приложение

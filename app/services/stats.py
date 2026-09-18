@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
 from typing import Any
 
 from app.keitaro.client import KeitaroClient
@@ -15,15 +16,17 @@ from app.keitaro.errors import KeitaroError
 
 logger = logging.getLogger(__name__)
 
-PERIODS = {"today": ("today", 1), "7d": ("7_days_ago", 7), "30d": ("1_month_ago", 30)}
+PERIODS = {"today": 1, "7d": 7, "30d": 30}  # период → сколько дней показывать, считая сегодня
 _MEASURES = ["clicks", "campaign_unique_clicks", "conversions", "revenue", "cr", "epc"]
 
 
 def _number(value: Any) -> float:
     try:
-        return round(float(value or 0), 4)
-    except (TypeError, ValueError):
+        number = float(value or 0)
+    except (TypeError, ValueError, OverflowError):
         return 0.0
+    # "NaN" и "1e999" float() принимает молча, а int() на nan/inf падает, и в JSON их не передать.
+    return round(number, 4) if math.isfinite(number) else 0.0
 
 
 def _filters(keitaro_campaign_id: int) -> list[dict[str, Any]]:
@@ -39,13 +42,16 @@ async def campaign_stats(
              "offers": {"<stream_id>:<offer_id>": {clicks, conversions, ..., "trend": [...]}},
              "streams": {"<stream_id>": {"clicks": n}}}`
     """
-    interval, days_count = PERIODS.get(period, PERIODS["7d"])
+    period = period if period in PERIODS else "7d"  # мусор в параметре не возвращаем как есть
+    days_count = PERIODS[period]
     today = dt.datetime.now(dt.timezone.utc).date()
     days = [(today - dt.timedelta(days=offset)).isoformat()
             for offset in range(days_count - 1, -1, -1)]
     result: dict[str, Any] = {"available": True, "period": period, "days": days,
                               "offers": {}, "streams": {}}
-    report_range = {"interval": interval, "timezone": "UTC"}
+    # Явные даты вместо интервалов Keitaro вида `7_days_ago`: тот захватывает лишний день,
+    # и итог по офферу перестаёт сходиться с суммой тренда по дням.
+    report_range = {"from": days[0], "to": days[-1], "timezone": "UTC"}
     try:
         totals = await client.build_report({
             "range": report_range, "dimensions": ["stream_id", "offer_id"],

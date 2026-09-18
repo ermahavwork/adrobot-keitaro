@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -178,9 +178,15 @@ class CampaignCreator:
         plans = []
         for codes in geo_sets:
             name = request.name
-            if len(geo_sets) > 1:
-                name = (name.replace("{geo}", codes[0]) if "{geo}" in name
-                        else f"{name} [{codes[0]}]")
+            # {geo} подставляется всегда: одна страна — её код, несколько стран в одной
+            # кампании — коды через «+» (AU+RO). Без плейсхолдера код дописывается только
+            # при разбиении по странам, чтобы кампании различались.
+            if "{geo}" in name:
+                name = name.replace("{geo}", "+".join(codes))
+            elif request.split_by_geo:
+                # Суффикс ставим и при одной стране: если из пачки «MX, AU» создалась только MX,
+                # повтор по одной AU должен дать то же имя «… [AU]», а не кампанию без суффикса.
+                name = f"{name} [{codes[0]}]"
             plans.append(CampaignPlan(
                 name=name, geo=codes, offer_ids=list(request.offer_ids), warnings=list(warnings),
                 custom_alias=bool(request.alias),
@@ -295,27 +301,37 @@ class CampaignCreator:
         *,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        previous = await self.find_previous(session, idempotency_key, request)
+        if idempotency_key:
+            # Ключ нужен минуты (двойной клик, ретрай после обрыва), а не вечно: старые записи убираем.
+            cutoff = utcnow() - dt.timedelta(days=self._settings.idempotency_ttl_days)
+            await session.execute(delete(IdempotencyRecord).where(IdempotencyRecord.created_at < cutoff))
+            await session.commit()
+        # Проверка без создания ключом не пользуется: она ничего не создаёт и должна показывать
+        # план, а не «повтор» когда-то выполненного настоящего запроса.
+        previous = None if request.dry_run else await self.find_previous(session, idempotency_key, request)
         if previous is not None:
             return previous
 
-        plans = await self.build_plans(session, request)
-        if not request.allow_duplicate_name:
-            await self._ensure_names_free(plans)
-        if request.dry_run:
-            return {"dry_run": True, "results": [
-                {"status": "planned", "plan": plan.as_dict()} for plan in plans]}
-
-        if idempotency_key:
+        # Ключ занимаем ДО проверок формы и названия. Иначе отставший на долю секунды дубль
+        # (двойной клик) проходил проверку ключа, пока первый запрос его ещё не занял, а потом
+        # натыкался на только что созданную кампанию и получал «название занято» вместо «уже выполняется».
+        reserve = bool(idempotency_key) and not request.dry_run
+        if reserve:
             await self._reserve_key(session, idempotency_key, request)
         try:
+            plans = await self.build_plans(session, request)
+            if not request.allow_duplicate_name:
+                await self._ensure_names_free(plans)
+            if request.dry_run:
+                return {"dry_run": True, "results": [
+                    {"status": "planned", "plan": plan.as_dict()} for plan in plans]}
             response = await self._create_all(session, plans)
         except BaseException:
-            if idempotency_key:
+            if reserve:
                 await session.rollback()
                 await self._release_key(session, idempotency_key, None)
             raise
-        if idempotency_key:
+        if reserve:
             created_any = any(r["status"] == "created" for r in response["results"])
             await self._release_key(session, idempotency_key, response if created_any else None)
         return response
@@ -359,19 +375,22 @@ class CampaignCreator:
             offer_stream = await self._client.create_stream(
                 {**plan.offer_stream_payload, "campaign_id": keitaro_id})
             self._verify(plan, geo_stream, offer_stream)
-        except (KeitaroError, CreatorError) as exc:
+            # Сохранение у себя — тоже часть саги: если оно упадёт, в трекере останется кампания,
+            # о которой AdRobot не знает, а повтор упрётся в «название занято».
+            campaign = await self._save_locally(session, plan, campaign_row, geo_stream, offer_stream)
+        except Exception as exc:
+            await session.rollback()
             rolled_back = await self._compensate(keitaro_id)
             tail = (" Недосозданная кампания отправлена в архив Keitaro." if rolled_back else
                     f" ВНИМАНИЕ: кампанию #{keitaro_id} не удалось убрать — удалите её вручную.")
             raise CreatorError(
                 "stream_creation_failed",
-                f"Кампания создалась, но поток — нет: {getattr(exc, 'message', exc)}{tail}",
+                f"Кампания создалась, но довести её до конца не удалось: "
+                f"{getattr(exc, 'message', None) or type(exc).__name__}.{tail}",
                 http_status=502,
                 details={"keitaro_campaign_id": keitaro_id, "rolled_back": rolled_back}) from exc
 
-        campaign = await self._save_locally(session, plan, campaign_row, geo_stream, offer_stream)
-        defaults = await self._dictionaries.resolve_defaults(session)
-        tracking = str(defaults.get("tracking_domain_url") or "").rstrip("/")
+        tracking = await self._dictionaries.tracking_domain_url(session)
         return {
             "campaign_id": campaign.id,
             "keitaro_campaign_id": keitaro_id,

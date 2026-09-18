@@ -11,38 +11,44 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 import httpx
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.exc import OperationalError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app import __version__
-from app.api import routes_campaigns, routes_meta, routes_streams
+from app.api import routes_campaigns, routes_meta, routes_streams, routes_tools
 from app.api.deps import require_token
 from app.config import Settings, get_settings
 from app.keitaro.client import KeitaroClient
 from app.keitaro.errors import KeitaroError
 from app.logging_conf import setup_logging
+from app.services import editor
 from app.services.audit import current_actor
 from app.services.creator import CampaignCreator, CreatorError
 from app.services.dictionaries import DictionaryService
-from app.services.editor import EditorError, StreamLocks
+from app.services.editor import EditorError
+from app.services.locks import CampaignLocks, LockBusyError
 
 logger = logging.getLogger(__name__)
 WEB_DIR = Path(__file__).parent / "web"
 
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
     "Referrer-Policy": "no-referrer",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
-    "Cross-Origin-Opener-Policy": "same-origin",
 }
+# Cross-Origin-Opener-Policy не ставим: на http-адресе в локальной сети браузер его игнорирует
+# и пишет об этом ошибку в консоль, а всплывающих окон у интерфейса нет.
 # Интерфейс не использует ни inline-скриптов, ни eval, ни сторонних доменов.
 CSP_APP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
            "connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
@@ -63,6 +69,7 @@ def create_app(
     setup_logging(settings.log_level, secrets=[
         settings.keitaro_api_key.get_secret_value(),
         settings.adrobot_auth_token.get_secret_value(),
+        *[token for _name, token, _ro in settings.auth_tokens()],
     ])
 
     @asynccontextmanager
@@ -82,7 +89,8 @@ def create_app(
         app.state.client = client
         app.state.dictionaries = dictionaries
         app.state.creator = CampaignCreator(client, dictionaries, settings)
-        app.state.locks = StreamLocks()
+        app.state.locks = CampaignLocks()
+        editor.MAX_SNAPSHOTS_PER_STREAM = settings.snapshots_per_stream
         if not settings.keitaro_configured:
             logger.warning("Keitaro не настроен: заполните KEITARO_BASE_URL и KEITARO_API_KEY")
         yield
@@ -96,10 +104,39 @@ def create_app(
             "Все кнопки интерфейса — это методы ниже; их можно дёргать прямо отсюда."
         ),
         lifespan=lifespan,
+        docs_url=None,  # свою страницу /docs отдаём ниже: со скриптами из репозитория, без CDN
+        redoc_url=None,
+        root_path=settings.root_path.rstrip("/"),
     )
+
+    allowed_hosts = [host.strip() for host in settings.allowed_hosts.split(",") if host.strip()]
+    if allowed_hosts:
+        # Защита от DNS-rebinding: отвечаем только на запросы к перечисленным именам.
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
+
+    @app.get("/docs", include_in_schema=False)
+    async def swagger_ui() -> HTMLResponse:
+        # Адреса относительные: страница одинаково работает и в корне, и в подкаталоге за прокси.
+        return get_swagger_ui_html(
+            openapi_url="openapi.json", title="AdRobot · API",
+            swagger_js_url="static/vendor/swagger-ui/swagger-ui-bundle.js",
+            swagger_css_url="static/vendor/swagger-ui/swagger-ui.css",
+            swagger_favicon_url="static/img/favicon.svg",
+        )
 
     @app.middleware("http")
     async def security_and_actor(request: Request, call_next):  # type: ignore[no-untyped-def]
+        # Изменяющий запрос с чужого сайта отклоняем. Без этого страница-ловушка могла бы одной
+        # скрытой формой нажать Push у того, кто держит AdRobot открытым на localhost (CSRF):
+        # токен по умолчанию не требуется, а POST без тела браузер шлёт без предварительного запроса.
+        if request.method not in SAFE_METHODS and request.url.path.startswith("/api/"):
+            origin = request.headers.get("origin")
+            # За обратным прокси «наш» адрес может приехать в X-Forwarded-Host, а не в Host.
+            own_hosts = {request.headers.get("host", ""), request.headers.get("x-forwarded-host", "")}
+            foreign_origin = bool(origin) and urlsplit(origin).netloc not in own_hosts
+            if request.headers.get("sec-fetch-site") == "cross-site" or foreign_origin:
+                return _error("cross_site_request", "Запрос пришёл с другого сайта и отклонён. "
+                              "Откройте AdRobot по его адресу.", 403)
         # Имя приходит percent-encoded: в HTTP-заголовках нельзя передавать кириллицу как есть.
         actor = unquote(request.headers.get("X-AdRobot-User") or "").strip()[:64]
         token = current_actor.set(actor)
@@ -129,6 +166,10 @@ def create_app(
     async def _keitaro_error(_: Request, exc: KeitaroError) -> JSONResponse:
         return _error(exc.code, exc.message, exc.http_status, exc.details)
 
+    @app.exception_handler(LockBusyError)
+    async def _lock_busy(_: Request, exc: LockBusyError) -> JSONResponse:
+        return _error(exc.code, exc.message, exc.http_status)
+
     @app.exception_handler(RequestValidationError)
     async def _validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
         problems = []
@@ -137,6 +178,15 @@ def create_app(
             problems.append(f"{field}: {err.get('msg', '')}".strip(": "))
         return _error("validation", "Проверьте данные запроса: " + "; ".join(problems), 422,
                       {"errors": problems})
+
+    @app.exception_handler(OverflowError)
+    async def _number_too_big(_: Request, exc: OverflowError) -> JSONResponse:
+        # ID из пути или query (…/campaigns/9223372036854775808) не помещается в INTEGER базы:
+        # sqlite3 бросает OverflowError. Это ошибка запроса, а не сервера.
+        logger.warning("число вне диапазона базы данных: %s", exc)
+        problem = "число слишком велико для идентификатора"
+        return _error("validation", f"Проверьте данные запроса: {problem}.", 422,
+                      {"errors": [problem]})
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_error(_: Request, exc: StarletteHTTPException) -> JSONResponse:
@@ -162,11 +212,21 @@ def create_app(
     protected = [Depends(require_token)]
     app.include_router(routes_meta.router, prefix="/api", dependencies=protected)
     app.include_router(routes_campaigns.router, prefix="/api", dependencies=protected)
+    # routes_tools раньше routes_streams: у него есть точные пути (/streams/drafts, /streams/push-many),
+    # которые иначе перехватил бы шаблон /streams/{stream_id}.
+    app.include_router(routes_tools.router, prefix="/api", dependencies=protected)
     app.include_router(routes_streams.router, prefix="/api", dependencies=protected)
+
+    @app.get("/api/auth/me", tags=["Служебное"], dependencies=protected,
+             summary="Чей это токен и можно ли с ним что-то менять")
+    async def auth_me(request: Request) -> dict[str, Any]:
+        """Интерфейс спрашивает это один раз: с токеном «только чтение» он не делает авто-Fetch."""
+        return {"name": getattr(request.state, "token_name", ""),
+                "read_only": getattr(request.state, "read_only", False)}
 
     @app.get("/api/auth/mode", tags=["Служебное"], summary="Нужен ли интерфейсу токен доступа")
     async def auth_mode() -> dict[str, bool]:
-        return {"token_required": bool(settings.adrobot_auth_token.get_secret_value())}
+        return {"token_required": settings.auth_enabled}
 
     app.mount("/static", StaticFiles(directory=WEB_DIR / "static"), name="static")
 

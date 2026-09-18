@@ -1,10 +1,16 @@
 // Клиент к API AdRobot. Одна функция `api()`: таймаут, единый формат ошибок,
 // токен доступа (если включён на сервере) и имя пользователя для журнала операций.
 
+// Каталог, из которого открыт интерфейс: "/" при обычном запуске, "/adrobot/" за обратным
+// прокси в подкаталоге. Все пути API строим от него, поэтому приложению всё равно, где оно стоит.
+const BASE = new URL(".", document.baseURI).pathname;
+export const url = (path) => BASE + String(path).replace(/^\//, "");
+
 const TOKEN_KEY = "adrobot.token";
 const USER_KEY = "adrobot.user";
 
 export const session = {
+  readOnly: false, // токен «только чтение»: выставляет app.js по ответу /api/auth/me
   get token() { return sessionStorage.getItem(TOKEN_KEY) || ""; },
   set token(value) { value ? sessionStorage.setItem(TOKEN_KEY, value) : sessionStorage.removeItem(TOKEN_KEY); },
   get user() { return localStorage.getItem(USER_KEY) || ""; },
@@ -30,11 +36,12 @@ export async function api(method, path, body, { headers = {}, timeoutMs = 60000 
   const requestHeaders = { Accept: "application/json", ...headers };
   if (body !== undefined) requestHeaders["Content-Type"] = "application/json";
   if (session.token) requestHeaders.Authorization = `Bearer ${session.token}`;
-  if (session.user) requestHeaders["X-AdRobot-User"] = encodeURIComponent(session.user).slice(0, 64);
+  // Режем ДО кодирования: иначе percent-последовательность кириллицы обрывается посередине.
+  if (session.user) requestHeaders["X-AdRobot-User"] = encodeURIComponent(session.user.slice(0, 64));
 
   let response;
   try {
-    response = await fetch(path, {
+    response = await fetch(url(path), {
       method, headers: requestHeaders, signal: controller.signal, cache: "no-store",
       body: body === undefined ? undefined : JSON.stringify(body),
     });

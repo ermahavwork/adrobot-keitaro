@@ -28,7 +28,9 @@ async def health(session: SessionDep, client: ClientDep, settings: SettingsDep,
         "admin_url": settings.admin_url,
     }
     try:
+        # По одной таблице из каждой миграции: так видно и «забыли upgrade», и «обновили код, но не базу».
         await session.execute(text("SELECT 1 FROM campaigns LIMIT 1"))
+        await session.execute(text("SELECT 1 FROM campaign_locks LIMIT 1"))
     except Exception as exc:  # любая ошибка БД = нездоров, а не 500
         await session.rollback()
         missing = "no such table" in str(exc).lower() or "does not exist" in str(exc).lower()

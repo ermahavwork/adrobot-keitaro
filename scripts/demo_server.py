@@ -45,8 +45,9 @@ def demo_report(fake: FakeKeitaro, body: dict) -> list[dict]:
     campaign_id = next((f.get("expression") for f in body.get("filters", [])
                         if f.get("name") == "campaign_id"), None)
     by_day = "day" in body.get("dimensions", [])
-    days = {"today": 1, "7_days_ago": 7, "1_month_ago": 30}.get(body.get("range", {}).get("interval"), 7)
     today = dt.datetime.now(dt.timezone.utc).date()
+    start = dt.date.fromisoformat(body.get("range", {}).get("from") or today.isoformat())
+    days = max(1, (today - start).days + 1)
     rows = []
     for stream in fake.streams.values():
         if stream["campaign_id"] != campaign_id:

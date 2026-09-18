@@ -7,6 +7,7 @@ import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -15,6 +16,7 @@ from pydantic import SecretStr
 
 from app import __version__, db
 from app.main import create_app
+from app.services import dictionaries
 from tests.conftest import Editor, make_settings
 from tests.fake_keitaro import FakeKeitaro
 
@@ -115,37 +117,37 @@ class TestHealth:
 class TestLookups:
     def test_shape_for_the_create_form(self, client):
         body = client.get("/api/meta/lookups").json()
-        assert body["groups"] == [{"id": 4970, "name": "FORTESTS"}]
-        assert body["traffic_sources"] == [{"id": 473, "name": "FORTESTS",
+        assert body["groups"] == [{"id": 22, "name": "FORTESTS"}]
+        assert body["traffic_sources"] == [{"id": 33, "name": "FORTESTS",
                                             "template_name": "facebook"}]
-        assert body["domains"] == [{"id": 4622, "name": "https://in.example.test/"}]
+        assert body["domains"] == [{"id": 11, "name": "https://in.example.test/"}]
         assert body["domains_visible"] is True and body["inferred_domain_id"] is None
         assert body["warnings"] == []
-        assert body["defaults"]["default_group_id"] == 4970
+        assert body["defaults"]["default_group_id"] == 22
 
     def test_inactive_sources_and_domains_are_not_offered(self, client, fake):
         fake.sources.append({"id": 474, "name": "old source", "state": "deleted"})
         fake.domains.append({"id": 4623, "name": "https://parked.test/", "state": "deleted"})
         body = client.get("/api/meta/lookups").json()
-        assert [s["id"] for s in body["traffic_sources"]] == [473]
-        assert [d["id"] for d in body["domains"]] == [4622]
+        assert [s["id"] for s in body["traffic_sources"]] == [33]
+        assert [d["id"] for d in body["domains"]] == [11]
 
     def test_hidden_domains_are_inferred_from_campaigns_with_warning(self, client, fake):
         fake.seed_campaign("existing")
         fake.domains_visible = False
         body = client.get("/api/meta/lookups").json()
         assert body["domains"] == [] and body["domains_visible"] is False
-        assert body["inferred_domain_id"] == 4622
-        assert any("не виден справочник доменов" in w and "#4622" in w for w in body["warnings"])
+        assert body["inferred_domain_id"] == 11
+        assert any("не виден справочник доменов" in w and "#11" in w for w in body["warnings"])
         assert (body["defaults"]["default_domain_id"],
-                body["defaults"]["default_domain_id_source"]) == (4622, "авто")
+                body["defaults"]["default_domain_id_source"]) == (11, "авто")
 
     def test_most_popular_domain_wins_the_inference(self, client, fake):
         for index in range(3):
             campaign_id, _, _ = fake.seed_campaign(f"campaign {index}")
-            fake.campaigns[campaign_id]["domain_id"] = 9999 if index == 0 else 4622
+            fake.campaigns[campaign_id]["domain_id"] = 9999 if index == 0 else 11
         fake.domains_visible = False
-        assert client.get("/api/meta/lookups").json()["inferred_domain_id"] == 4622
+        assert client.get("/api/meta/lookups").json()["inferred_domain_id"] == 11
 
     def test_hidden_domains_and_no_campaigns_ask_for_explicit_setting(self, client, fake):
         fake.domains_visible = False
@@ -159,7 +161,7 @@ class TestLookups:
         fake.seed_campaign("existing")
         fake.fail_next("GET", r"^/domains$", status=403, body={"error": "Access denied"}, times=50)
         body = client.get("/api/meta/lookups").json()
-        assert body["domains_visible"] is False and body["inferred_domain_id"] == 4622
+        assert body["domains_visible"] is False and body["inferred_domain_id"] == 11
 
     def test_several_groups_mean_no_automatic_choice(self, client, fake):
         fake.groups.append({"id": 5000, "name": "SECOND", "position": 2, "type": "campaigns"})
@@ -169,7 +171,7 @@ class TestLookups:
 
     def test_groups_of_other_types_are_not_mixed_in(self, client, fake):
         fake.groups.append({"id": 6000, "name": "offers group", "position": 1, "type": "offers"})
-        assert [g["id"] for g in client.get("/api/meta/lookups").json()["groups"]] == [4970]
+        assert [g["id"] for g in client.get("/api/meta/lookups").json()["groups"]] == [22]
 
     def test_lookups_are_cached_until_refresh_is_asked(self, fake, tmp_path):
         with running_app(fake, tmp_path, dictionary_ttl_seconds=300) as cached:
@@ -179,7 +181,7 @@ class TestLookups:
             fake.groups.append({"id": 5000, "name": "NEW", "position": 2, "type": "campaigns"})
             assert len(cached.get("/api/meta/lookups").json()["groups"]) == 1
             fresh = cached.get("/api/meta/lookups", params={"refresh": "true"}).json()
-            assert [g["id"] for g in fresh["groups"]] == [4970, 5000]
+            assert [g["id"] for g in fresh["groups"]] == [22, 5000]
 
     def test_keitaro_down_is_a_504_in_our_format(self, client, fake):
         fake.fail_next("GET", r"^/groups$", times=50, exception=down)
@@ -350,9 +352,9 @@ class TestOffersRefresh:
 class TestSettings:
     def test_defaults_come_with_their_origin(self, client):
         assert client.get("/api/settings").json() == {
-            "default_domain_id": 4622, "default_domain_id_source": "авто",
-            "default_group_id": 4970, "default_group_id_source": "авто",
-            "default_traffic_source_id": 473, "default_traffic_source_id_source": "авто",
+            "default_domain_id": 11, "default_domain_id_source": "авто",
+            "default_group_id": 22, "default_group_id_source": "авто",
+            "default_traffic_source_id": 33, "default_traffic_source_id_source": "авто",
             "default_redirect_url": "https://google.com", "default_redirect_url_source": ".env",
             "tracking_domain_url": "https://in.example.test", "tracking_domain_url_source": ".env"}
 
@@ -373,7 +375,7 @@ class TestSettings:
                                           "default_redirect_url": "https://example.org/x"})
         body = client.put("/api/settings", json={"default_group_id": None,
                                                  "default_redirect_url": blank}).json()
-        assert (body["default_group_id"], body["default_group_id_source"]) == (4970, "авто")
+        assert (body["default_group_id"], body["default_group_id_source"]) == (22, "авто")
         assert (body["default_redirect_url"], body["default_redirect_url_source"]) == \
             ("https://google.com", ".env")
 
@@ -389,9 +391,9 @@ class TestSettings:
         assert body["tracking_domain_url"] == "https://go.example.org"
 
     def test_env_value_is_marked_and_can_be_overridden(self, fake, tmp_path):
-        with running_app(fake, tmp_path, default_group_id=4970, default_domain_id=4622) as app:
+        with running_app(fake, tmp_path, default_group_id=22, default_domain_id=11) as app:
             body = app.get("/api/settings").json()
-            assert (body["default_group_id"], body["default_group_id_source"]) == (4970, ".env")
+            assert (body["default_group_id"], body["default_group_id_source"]) == (22, ".env")
             body = app.put("/api/settings", json={"default_group_id": 12}).json()
             assert (body["default_group_id"], body["default_group_id_source"]) == (12, "настройки")
             assert body["default_domain_id_source"] == ".env"
@@ -614,7 +616,7 @@ class TestImport:
     def test_more_than_one_page_of_campaigns(self, client, fake):
         for index in range(1, 502):
             fake.campaigns[index] = {"id": index, "name": f"bulk {index}", "alias": f"b{index}",
-                                     "state": "active", "group_id": 4970, "domain_id": 4622}
+                                     "state": "active", "group_id": 22, "domain_id": 11}
         assert client.post("/api/campaigns/import").json() == {"total": 501, "created": 501,
                                                                "gone": 0}
         assert client.get("/api/campaigns", params={"limit": 1}).json()["total"] == 501
@@ -651,7 +653,7 @@ class TestOpenCampaign:
         assert opened["keitaro_id"] == campaign_id
         view = client.get(f"/api/campaigns/{opened['id']}").json()
         assert (view["name"], view["origin"], view["streams"]) == ("to open", "keitaro", [])
-        assert view["streams_fetched_at"] is None and view["group_id"] == 4970
+        assert view["streams_fetched_at"] is None and view["group_id"] == 22
 
     def test_open_twice_is_same_campaign_and_single_request(self, client, fake):
         campaign_id, _, _ = fake.seed_campaign()
@@ -753,53 +755,142 @@ class TestNotFoundFormat:
 
 
 class TestCampaignViewIsLocal:
-    """`GET /api/campaigns/{id}` обещает отдавать кампанию «из базы, без сети»."""
+    """`GET /api/campaigns/{id}` отдаёт кампанию «из базы, без сети».
 
-    REASON = (
-        "app/api/routes_campaigns.py:campaign_view ради одной строки tracking_domain_url зовёт "
-        "dictionaries.resolve_defaults(), а тот — get_lookups(): как только кэш справочников "
-        "устарел (в бою раз в 5 минут, в тестах всегда), просмотр кампании делает три запроса "
-        "в Keitaro (/groups, /traffic_sources, /domains), а при недоступном трекере отвечает "
-        "504 — локальный черновик нельзя даже открыть. Правка: брать tracking_domain_url из "
-        "get_overrides()/settings без справочников либо отдавать устаревший кэш при ошибке.")
+    Регрессия: ради одной строки tracking_domain_url вид кампании звал resolve_defaults() →
+    get_lookups() и делал три запроса в Keitaro, а при недоступном трекере отвечал 504 —
+    локальный черновик нельзя было даже открыть.
+    """
 
-    @pytest.mark.xfail(strict=True, reason=REASON)
     def test_viewing_a_campaign_does_not_call_keitaro(self, editor):
         editor.fake.requests.clear()
         assert editor.client.get(f"/api/campaigns/{editor.campaign_id}").status_code == 200
         assert editor.fake.requests == []
 
-    @pytest.mark.xfail(strict=True, reason=REASON)
-    def test_draft_can_be_viewed_while_keitaro_is_down(self, fake, tmp_path):
-        with running_app(fake, tmp_path) as app:
-            app_editor = Editor(app, fake, *fake.seed_campaign()[::2])
-            app_editor.add(OXYS)
-            fake.fail_next("GET", r".*", times=500, exception=down)
-            response = app.get(f"/api/campaigns/{app_editor.campaign_id}")
+    def test_draft_can_be_viewed_while_keitaro_is_down(self, editor):
+        editor.add(OXYS)
+        editor.fake.fail_next("GET", r".*", times=500, exception=down)
+        response = editor.client.get(f"/api/campaigns/{editor.campaign_id}")
         assert response.status_code == 200
-        assert response.json()["is_dirty"] is True
+        body = response.json()
+        assert body["is_dirty"] is True
+        assert body["campaign_url"] == f"https://in.example.test/{body['alias']}"
 
-    def test_single_stream_view_already_works_offline(self, editor):
+    def test_single_stream_view_works_offline_too(self, editor):
         stream_id = editor.add(OXYS)["id"]
         editor.fake.requests.clear()
         editor.fake.fail_next("GET", r".*", times=500, exception=down)
         response = editor.client.get(f"/api/streams/{stream_id}")
         assert response.status_code == 200 and response.json()["is_dirty"] is True
-        assert editor.fake.requests == [], "вид одного потока сеть не трогает — так и должно быть"
+        assert editor.fake.requests == []
+
+    def test_campaign_link_uses_tracking_domain_saved_in_interface(self, editor):
+        editor.client.put("/api/settings", json={"tracking_domain_url": "https://go.example.org/"})
+        view = editor.client.get(f"/api/campaigns/{editor.campaign_id}").json()
+        assert view["campaign_url"] == f"https://go.example.org/{view['alias']}"
+
+    def test_campaign_link_is_empty_without_tracking_domain(self, fake, tmp_path):
+        with running_app(fake, tmp_path, tracking_domain_url="") as app:
+            app_editor = Editor(app, fake, *fake.seed_campaign()[::2])
+            view = app.get(f"/api/campaigns/{app_editor.campaign_id}").json()
+            assert view["campaign_url"] == ""
+            assert create(app)["results"][0]["campaign_url"] == ""
+
+    def test_editor_buttons_that_need_no_network_work_while_keitaro_is_down(self, editor):
+        stream_id = editor.stream["id"]
+        editor.fake.fail_next("GET", r".*", times=500, exception=down)
+        assert editor.client.put(f"/api/streams/{stream_id}/offers/{editor._binding_id(FITO)}/pin",
+                                 json={"pinned": True}).status_code == 200
+        assert editor.remove(A_0008)["is_dirty"] is True
+        assert editor.cancel()["is_dirty"] is False
+
+
+class TestDictionaryCacheOnFreshlyBootedMachine:
+    """Регрессия из CI: `time.monotonic()` считает от старта машины. «Ещё не загружали» было
+    записано нулём, и при аптайме меньше TTL справочник офферов выглядел свежим и не грузился."""
+
+    @pytest.fixture
+    def just_booted(self, monkeypatch) -> dict[str, float]:
+        """Часы модуля справочников: машина работает пять секунд. Глобальный time не трогаем —
+        на нём живёт цикл событий."""
+        clock = {"now": 5.0}
+        monkeypatch.setattr(dictionaries, "time", SimpleNamespace(monotonic=lambda: clock["now"]))
+        return clock
+
+    def test_offers_are_loaded_on_first_use_even_if_uptime_is_below_ttl(self, fake, tmp_path,
+                                                                        just_booted):
+        with running_app(fake, tmp_path, dictionary_ttl_seconds=300) as app:
+            found = app.get("/api/offers", params={"q": "37"}).json()
+            assert [offer["id"] for offer in found] == [A_0008, A_0009]
+            app.get("/api/offers", params={"q": "374"})
+            assert calls(fake, "GET", "/offers") == 1, "загрузили один раз и дальше берём из кэша"
+
+    def test_offer_cache_expires_by_ttl(self, fake, tmp_path, just_booted):
+        with running_app(fake, tmp_path, dictionary_ttl_seconds=300) as app:
+            app.get("/api/offers")
+            just_booted["now"] = 5.0 + 299
+            app.get("/api/offers")
+            assert calls(fake, "GET", "/offers") == 1
+            just_booted["now"] = 5.0 + 301
+            app.get("/api/offers")
+            assert calls(fake, "GET", "/offers") == 2
+
+    def test_campaign_can_be_created_right_after_boot(self, fake, tmp_path, just_booted):
+        with running_app(fake, tmp_path, dictionary_ttl_seconds=300) as app:
+            assert create(app)["results"][0]["status"] == "created"
+
+    def test_lookups_are_loaded_on_first_use_and_then_cached(self, fake, tmp_path, just_booted):
+        with running_app(fake, tmp_path, dictionary_ttl_seconds=300) as app:
+            assert app.get("/api/meta/lookups").json()["groups"] == [{"id": 22,
+                                                                       "name": "FORTESTS"}]
+            app.get("/api/meta/lookups")
+            assert calls(fake, "GET", "/groups") == 1
+            just_booted["now"] = 5.0 + 301
+            app.get("/api/meta/lookups")
+            assert calls(fake, "GET", "/groups") == 2
+
+    def test_failed_first_load_is_not_remembered_as_loaded(self, fake, tmp_path, just_booted):
+        with running_app(fake, tmp_path, dictionary_ttl_seconds=300) as app:
+            fake.fail_next("GET", r"^/offers$", status=500, body="boom")
+            assert app.get("/api/offers").status_code == 502
+            assert [offer["id"] for offer in app.get("/api/offers", params={"q": "37"}).json()] == \
+                [A_0008, A_0009]
 
 
 class TestGeoPlaceholderInName:
-    @pytest.mark.xfail(strict=True, reason=(
-        "app/services/creator.py:build_plans подставляет {geo} в название только когда кампаний "
-        "получается несколько (len(geo_sets) > 1). Та же форма с галочкой «отдельная кампания на "
-        "страну», но с одной страной создаёт в Keitaro кампанию с буквальным «{geo}» в имени "
-        "(без галочки — тоже). Правка: заменять плейсхолдер всегда — на код страны, а для "
-        "нескольких стран без разбиения на коды через «+»."))
-    def test_placeholder_is_substituted_for_single_country_too(self, client, fake):
-        result = create(client, name="Spring {geo}", geo="AU", split_by_geo=True)
+    """Регрессия: {geo} подставлялся только когда кампаний получалось несколько; форма с одной
+    страной создавала в Keitaro кампанию с буквальным «{geo}» в названии."""
+
+    @pytest.mark.parametrize("split_by_geo", [True, False])
+    def test_placeholder_is_substituted_for_single_country_too(self, client, fake, split_by_geo):
+        result = create(client, name="Spring {geo}", geo="AU", split_by_geo=split_by_geo)
         assert result["results"][0]["name"] == "Spring AU"
-        assert "{geo}" not in next(iter(fake.campaigns.values()))["name"]
+        assert next(iter(fake.campaigns.values()))["name"] == "Spring AU"
+
+    def test_several_countries_in_one_campaign_are_joined_with_plus(self, client, fake):
+        result = create(client, name="{geo} promo", geo="AU, Румыния")["results"][0]
+        assert result["name"] == "AU+RO promo"
+        assert client.get(f"/api/campaigns/{result['campaign_id']}").json()["name"] == "AU+RO promo"
 
     def test_placeholder_works_when_split_gives_several_campaigns(self, client, fake):
         results = create(client, name="Spring {geo} promo", geo="MX,AU", split_by_geo=True)["results"]
         assert [r["name"] for r in results] == ["Spring MX promo", "Spring AU promo"]
+
+    def test_placeholder_may_repeat(self, client):
+        assert create(client, name="{geo}-{geo}")["results"][0]["name"] == "AU-AU"
+
+    def test_without_placeholder_code_is_appended_only_when_splitting(self, client):
+        assert create(client, name="Plain")["results"][0]["name"] == "Plain"
+        names = [r["name"] for r in create(client, name="Split", geo="MX,AU",
+                                           split_by_geo=True)["results"]]
+        assert names == ["Split [MX]", "Split [AU]"]
+
+    def test_dry_run_shows_the_substituted_name(self, client, fake):
+        plan = create(client, name="Plan {geo}", geo="RO", dry_run=True)["results"][0]["plan"]
+        assert plan["name"] == "Plan RO" and plan["requests"][0]["body"]["name"] == "Plan RO"
+        assert not fake.campaigns
+
+    def test_duplicate_check_sees_the_substituted_name(self, client, fake):
+        create(client, name="Dup AU")
+        error = create(client, expect=409, name="Dup {geo}")["error"]
+        assert error["code"] == "duplicate_name" and "«Dup AU»" in error["message"]

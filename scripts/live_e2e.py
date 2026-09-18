@@ -89,6 +89,9 @@ def main() -> int:
     parser.add_argument("--geo", default="AU")
     parser.add_argument("--keep", action="store_true", help="не архивировать тестовую кампанию")
     args = parser.parse_args()
+    for stream in (sys.stdout, sys.stderr):  # консоль Windows в cp1251 не знает «→» и «»
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     load_env()
     if not os.environ.get("KEITARO_BASE_URL") or not os.environ.get("KEITARO_API_KEY"):
         raise SystemExit("Нужны KEITARO_BASE_URL и KEITARO_API_KEY (в .env или в окружении).")
@@ -112,11 +115,11 @@ def main() -> int:
     key = {"Idempotency-Key": name}
     created = app.call("POST", "/api/campaigns", body, headers=key)["results"][0]
     check("кампания создана", created["status"] == "created", created)
-    replay = app.call("POST", "/api/campaigns", body, headers=key)
-    check("повтор с тем же ключом не создал дубль", replay.get("replayed") is True)
     campaign_id, kt_id = created["campaign_id"], created["keitaro_campaign_id"]
 
-    try:
+    try:  # всё после создания — под finally: что бы ни упало, кампания уйдёт в архив
+        replay = app.call("POST", "/api/campaigns", body, headers=key)
+        check("повтор с тем же ключом не создал дубль", replay.get("replayed") is True)
         row = kt.campaign(kt_id)
         check("в Keitaro проставлены домен, группа, источник",
               (row["domain_id"], row["group_id"], row["traffic_source_id"]) ==
@@ -211,6 +214,22 @@ def main() -> int:
         bad = post("/offers", {"offer_id": 999999999}, expect=422)
         check("несуществующий оффер отклонён (Keitaro принял бы молча)",
               bad["error"]["code"] == "offer_not_usable")
+        print("10. Инструменты: где используется оффер, советник, набор долей")
+        usage = app.call("GET", f"/api/offers/{b}/usage")
+        check("«где используется» видит оффер в нашей кампании",
+              any(r["keitaro_campaign_id"] == kt_id and r["state"] == "active" for r in usage["used"]))
+        advice = app.call("GET", f"/api/streams/{stream_id}/advice?period=7d&metric=cr")
+        check("советник без трафика честно говорит «рано» и ничего не меняет",
+              advice["ready"] is False and shares() == {b: 50, c: 50} and not view()["is_dirty"])
+        pinned = post("/apply-shares", {"shares": {str(binding(b)): 70, str(binding(c)): 30}}, expect=409)
+        check("закреплённую долю набор не меняет", pinned["error"]["code"] == "pinned_share")
+        app.call("PUT", f"/api/streams/{stream_id}/offers/{binding(b)}/pin", {"pinned": False})
+        applied = post("/apply-shares", {"shares": {str(binding(b)): 70, str(binding(c)): 30}})
+        check("набор долей попадает в черновик, а не в трекер",
+              applied["is_dirty"] and shares() == {b: 70, c: 30} and kt.offers(kt_stream) == {b: 50, c: 50})
+        pushed = app.call("POST", "/api/streams/push-many", {"stream_ids": [stream_id]})
+        check("публикация пачкой прошла обычный Push", pushed["pushed"] == 1
+              and kt.offers(kt_stream) == {b: 70, c: 30})
         log = app.call("GET", f"/api/operations?keitaro_campaign_id={kt_id}&limit=100")
         check("все операции записаны в журнал", log["total"] >= 15, log["total"])
     finally:

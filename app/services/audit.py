@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from contextvars import ContextVar
 from typing import Any
 
@@ -15,21 +14,6 @@ logger = logging.getLogger(__name__)
 
 # Кто выполняет текущий запрос; выставляет middleware из заголовка X-AdRobot-User.
 current_actor: ContextVar[str] = ContextVar("adrobot_actor", default="")
-
-
-class Stopwatch:
-    """Секундомер операции: `with Stopwatch() as sw: ...; sw.ms`."""
-
-    def __enter__(self) -> Stopwatch:
-        self._started = time.perf_counter()
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        pass
-
-    @property
-    def ms(self) -> int:
-        return int((time.perf_counter() - self._started) * 1000)
 
 
 async def record(

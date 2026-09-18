@@ -109,5 +109,5 @@ export async function renderSettings(container, { refreshHealth }) {
         h("div", { class: "card" }, h("div", { class: "card__body stack" },
           h("h2", {}, "Для разработчика"),
           h("p", { class: "small" }, "Все кнопки интерфейса — это методы REST API. Их можно вызвать и проверить вручную: ",
-            h("a", { href: "/docs", target: "_blank", rel: "noopener" }, "Swagger UI (/docs)"), "."))))));
+            h("a", { href: "docs", target: "_blank", rel: "noopener" }, "Swagger UI (/docs)"), "."))))));
 }

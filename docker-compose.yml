@@ -1,9 +1,21 @@
-# Запуск:  docker compose up --build   →  http://localhost:8000
-# Перед запуском: cp .env.example .env и впишите KEITARO_BASE_URL и KEITARO_API_KEY.
+# Приложение:  cp .env.example .env  (впишите KEITARO_BASE_URL и KEITARO_API_KEY)
+#              docker compose up --build                     →  http://localhost:8000
+# Демо:        docker compose --profile demo up --build demo →  http://localhost:8001
+#              (встроенный эмулятор Keitaro: ни ключ, ни .env не нужны)
+x-hardening: &hardening
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
 services:
   adrobot:
     build: .
-    env_file: .env
+    env_file:
+      # Без .env приложение тоже стартует и покажет экран «Осталось подключить Keitaro».
+      - path: .env
+        required: false
     environment:
       DATABASE_URL: sqlite+aiosqlite:////app/data/adrobot.sqlite3
     ports:
@@ -12,13 +24,21 @@ services:
     volumes:
       - adrobot-data:/app/data
     restart: unless-stopped
-    read_only: true
     tmpfs:
       - /tmp
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
+    <<: *hardening
+
+  demo:
+    profiles: ["demo"]
+    build: .
+    command: ["python", "scripts/demo_server.py", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "127.0.0.1:8001:8000"
+    tmpfs:
+      - /tmp
+      # База демо живёт в памяти контейнера и сбрасывается при каждом запуске.
+      - /app/data:uid=10001,gid=10001
+    <<: *hardening
 
 volumes:
   adrobot-data:

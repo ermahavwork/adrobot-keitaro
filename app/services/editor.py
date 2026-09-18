@@ -19,12 +19,11 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from collections import defaultdict
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -42,6 +41,7 @@ from app.models import (
 )
 from app.services import weights
 from app.services.dictionaries import DictionaryService
+from app.services.locks import CampaignLocks
 from app.services.weights import WeightItem, WeightsError
 
 logger = logging.getLogger(__name__)
@@ -62,15 +62,8 @@ class EditorError(Exception):
         self.details = details
 
 
-class StreamLocks:
-    """По одному asyncio-замку на кампанию: Fetch и правки её потоков идут строго по очереди,
-    поэтому двойной клик или две вкладки не приведут к гонке пересчётов."""
-
-    def __init__(self) -> None:
-        self._locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
-
-    def for_campaign(self, campaign_id: int) -> asyncio.Lock:
-        return self._locks[campaign_id]
+# Замок на кампанию вынесен в `services/locks.py` (работает и между процессами).
+StreamLocks = CampaignLocks
 
 
 # ---------------------------------------------------------------------- загрузка из базы
@@ -152,8 +145,24 @@ def _ensure_editable(stream: Stream) -> None:
 
 
 async def import_campaigns(session: AsyncSession, client: KeitaroClient) -> dict[str, int]:
-    """Синхронизирует список кампаний с Keitaro (только шапки, без потоков)."""
+    """Синхронизирует список кампаний с Keitaro (только шапки, без потоков).
+
+    Двойной клик «Импорт» (или второй воркер) вставляет те же кампании одновременно — тогда
+    проигравший натыкается на уникальный `keitaro_id`. Это не ошибка: откатываемся и проходим
+    ещё раз, теперь уже видя строки соседа.
+    """
     rows = await client.list_campaigns()
+    for attempt in range(3):
+        try:
+            return await _import_campaign_rows(session, rows)
+        except IntegrityError:
+            await session.rollback()
+            if attempt == 2:
+                raise
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+async def _import_campaign_rows(session: AsyncSession, rows: list[dict[str, Any]]) -> dict[str, int]:
     known = {c.keitaro_id: c for c in (await session.scalars(select(Campaign))).all()}
     seen: set[int] = set()
     created = 0
@@ -198,7 +207,12 @@ async def get_or_import_campaign(
         campaign = Campaign(keitaro_id=keitaro_id, origin="keitaro", geo=[])
         _fill_campaign(campaign, row)
         session.add(campaign)
-        await session.commit()
+        try:
+            await session.commit()
+        except IntegrityError:
+            # Двойной клик «Открыть» или две вкладки: строку успел вставить соседний запрос.
+            await session.rollback()
+            campaign = (await session.scalars(stmt)).one()
     return campaign
 
 
@@ -262,6 +276,10 @@ def _sync_bindings(stream: Stream, kt_offers: list[dict[str, Any]], *, discard_d
         binding.kt_binding_id = row["binding_id"]
         binding.was_published = True
         if not keep_draft:
+            if binding.state == STATE_REMOVED:
+                # Оффер вернули прямо в Keitaro. Это та же активация, что и Bring back: он встаёт
+                # в конец очереди, и неделимый остаток при следующем пересчёте достанется ему.
+                binding.sort_index = _next_sort_index(stream)
             binding.state, binding.share, binding.removed_at = row["state"], row["share"], None
 
     for binding in list(stream.bindings):
@@ -279,6 +297,15 @@ def _sync_bindings(stream: Stream, kt_offers: list[dict[str, Any]], *, discard_d
         binding.state, binding.share, binding.is_pinned = STATE_REMOVED, 0, False
 
 
+def _mirror_signature(campaign: Campaign) -> list[tuple[Any, ...]]:
+    """Слепок того, что AdRobot знает о потоках кампании: по нему видно, изменил ли что-то Fetch."""
+    return sorted(
+        (s.keitaro_id, s.name, s.position, s.state, s.is_deleted, str(s.summary),
+         tuple(sorted((b.offer_id, b.state, b.share, b.kt_state or "", b.kt_share or 0,
+                       b.kt_binding_id or 0) for b in s.bindings)))
+        for s in campaign.streams)
+
+
 async def fetch_streams(
     session: AsyncSession,
     client: KeitaroClient,
@@ -288,6 +315,7 @@ async def fetch_streams(
 ) -> dict[str, Any]:
     """«Fetch streams from KT». Возвращает сводку: сколько потоков, что ушло в архив."""
     rows = await client.get_campaign_streams(campaign.keitaro_id)
+    before = _mirror_signature(campaign)
     by_kt_id = {s.keitaro_id: s for s in campaign.streams}
     seen: set[int] = set()
     now = utcnow()
@@ -315,6 +343,10 @@ async def fetch_streams(
     for keitaro_id, stream in by_kt_id.items():
         if keitaro_id not in seen:
             stream.is_deleted = True
+            # Потока в трекере больше нет — публиковать его черновик некуда. Сбрасываем его,
+            # иначе кампания навсегда осталась бы «с черновиком», который нельзя ни отправить,
+            # ни отменить. Офферы потока уходят в архив как обычно.
+            _sync_bindings(stream, [], discard_draft=True)
     campaign.streams_fetched_at = now
     campaign.is_deleted = False
     await session.commit()
@@ -325,10 +357,34 @@ async def fetch_streams(
         "streams": len(seen),
         "gone_streams": sum(1 for s in campaign.streams if s.is_deleted),
         "archived_offers": newly_archived,
+        "changed": before != _mirror_signature(campaign),
     }
 
 
 # ---------------------------------------------------------------------- правки черновика
+
+
+async def _offer_problems(session: AsyncSession, dictionaries: DictionaryService,
+                          bindings: list[StreamOffer]) -> list[str]:
+    """Почему офферы этих привязок нельзя отправить в Keitaro (пусто = можно).
+
+    Оффер может быть просто не виден нашему ключу API (права в Keitaro). Если привязка уже
+    бывала в трекере — оффер существует, и вернуть его в поток можно. А вот оффер, который
+    справочник ЗНАЕТ как выключенный или удалённый, блокируется всегда.
+    """
+    if not bindings:
+        return []
+    offer_ids = [b.offer_id for b in bindings]
+    if not await dictionaries.ensure_offers_usable(session, offer_ids):
+        return []
+    known = await dictionaries.get_offers_map(session, set(offer_ids))
+    to_check = []
+    for binding in bindings:
+        offer = known.get(binding.offer_id)
+        invisible = offer is None or offer.is_missing
+        if not (invisible and binding.was_published):
+            to_check.append(binding.offer_id)
+    return await dictionaries.ensure_offers_usable(session, to_check) if to_check else []
 
 
 async def add_offer(
@@ -340,11 +396,11 @@ async def add_offer(
     if existing is not None and existing.state != STATE_REMOVED:
         raise EditorError("offer_already_in_stream", "Этот оффер уже есть в потоке.",
                           http_status=409)
+    if existing is not None:
+        return await bring_back(session, dictionaries, stream, existing.id)
     problems = await dictionaries.ensure_offers_usable(session, [offer_id])
     if problems:
         raise EditorError("offer_not_usable", " ".join(problems))
-    if existing is not None:
-        return await bring_back(session, dictionaries, stream, existing.id, check_offer=False)
     binding = StreamOffer(offer_id=offer_id, state=STATE_ACTIVE, share=0,
                           sort_index=_next_sort_index(stream))
     stream.bindings.append(binding)
@@ -363,7 +419,10 @@ async def remove_offer(session: AsyncSession, stream: Stream, binding_id: int) -
         # Добавили и передумали до публикации: в Keitaro его не было — архивировать нечего.
         stream.bindings.remove(binding)
     else:
-        binding.state, binding.share, binding.is_pinned = STATE_REMOVED, 0, False
+        # Закрепление не сбрасываем: если Remove отменят через Cancel, оффер вернётся таким,
+        # каким был, — с долей И с закреплением. В расчёте участвуют только активные привязки,
+        # так что флаг удалённой привязки ни на что не влияет; Bring back его снимает.
+        binding.state, binding.share = STATE_REMOVED, 0
         binding.removed_at = utcnow()
     try:
         _rebalance(stream)
@@ -389,10 +448,11 @@ async def bring_back(
     if binding.state != STATE_REMOVED:
         raise EditorError("not_removed", "Оффер не в архиве — возвращать нечего.", http_status=409)
     if check_offer:
-        problems = await dictionaries.ensure_offers_usable(session, [binding.offer_id])
+        problems = await _offer_problems(session, dictionaries, [binding])
         if problems:
             raise EditorError("offer_not_usable", " ".join(problems))
     binding.state, binding.share, binding.removed_at = STATE_ACTIVE, 0, None
+    binding.is_pinned = False  # возвращённый оффер получает долю заново — старое закрепление не в силе
     binding.sort_index = _next_sort_index(stream)
     _rebalance(stream)
     await session.commit()
@@ -439,6 +499,33 @@ async def recalculate(session: AsyncSession, stream: Stream, *, drop_pins: bool 
     await session.commit()
 
 
+async def apply_shares(session: AsyncSession, stream: Stream, shares: dict[int, int]) -> None:
+    """Применить готовый набор долей (совет советника) в ЧЕРНОВИК.
+
+    Закрепления не ставятся и не снимаются; закреплённую долю изменить нельзя. Набор обязан
+    давать ровно 100% вместе с теми офферами, которых он не касается.
+    """
+    _ensure_editable(stream)
+    active = {b.id: b for b in _active(stream)}
+    unknown = set(shares) - set(active)
+    if unknown:
+        raise EditorError("binding_not_found", "В наборе есть офферы, которых нет среди активных "
+                          "офферов потока. Обновите страницу.", http_status=404)
+    for binding_id, value in shares.items():
+        binding = active[binding_id]
+        if not 1 <= value <= weights.TOTAL:
+            raise EditorError("share_out_of_range", "Доля должна быть целым числом от 1 до 100.")
+        if binding.is_pinned and value != binding.share:
+            raise EditorError("pinned_share", f"Доля оффера #{binding.offer_id} закреплена — "
+                              "сначала снимите закрепление.", http_status=409)
+    total = sum(shares.get(binding_id, binding.share) for binding_id, binding in active.items())
+    if total != weights.TOTAL:
+        raise EditorError("invalid_distribution", f"Сумма долей получится {total}%, а должна быть 100%.")
+    for binding_id, value in shares.items():
+        active[binding_id].share = value
+    await session.commit()
+
+
 async def cancel(session: AsyncSession, stream: Stream) -> int:
     """CANCEL: выбросить черновик. Возвращает число отменённых изменений."""
     reverted = 0
@@ -452,6 +539,10 @@ async def cancel(session: AsyncSession, stream: Stream) -> int:
             binding.state, binding.share, binding.is_pinned = STATE_REMOVED, 0, False
             binding.removed_at = binding.removed_at or utcnow()
         else:
+            if binding.state != STATE_REMOVED and binding.share != (binding.kt_share or 0):
+                # Долю меняли вручную — а ручной ввод сам ставит закрепление. Отменяем и его,
+                # иначе «отменённые» 34% остались бы закреплёнными и исказили следующий пересчёт.
+                binding.is_pinned = False
             binding.state, binding.share = binding.kt_state, binding.kt_share or 0
             binding.removed_at = None
     await session.commit()
@@ -522,6 +613,7 @@ async def push(
     *,
     force: bool = False,
     allow_empty: bool = False,
+    allow_unknown_offers: bool = False,
 ) -> dict[str, Any]:
     """«Push to KT»: публикует черновик. Порядок: проверки → конфликт → снимок → PUT → сверка."""
     _ensure_editable(stream)
@@ -538,11 +630,24 @@ async def push(
         problems = weights.check_distribution(_weight_items(active))
         if problems:
             raise EditorError("invalid_distribution", " ".join(problems))
-    new_offer_ids = [b.offer_id for b in active if b.kt_state is None]
-    if new_offer_ids:
-        problems = await dictionaries.ensure_offers_usable(session, new_offer_ids)
-        if problems:
-            raise EditorError("offer_not_usable", " ".join(problems))
+    returning = [b for b in active if b.kt_state is None]
+    problems = await _offer_problems(session, dictionaries, returning)
+    if problems:
+        raise EditorError("offer_not_usable", " ".join(problems))
+    # Оффер, которого нет в справочнике, мог быть не «невидим ключу», а удалён в трекере — снаружи
+    # это неотличимо, а Keitaro молча примет и несуществующий ID. Вернуть такой оффер в черновик
+    # можно, но отправить в трекер — только с явным подтверждением.
+    known = await dictionaries.get_offers_map(session, {b.offer_id for b in returning})
+    unknown = [b.offer_id for b in returning
+               if b.offer_id not in known or known[b.offer_id].is_missing]
+    if unknown and not allow_unknown_offers:
+        listed = ", ".join(f"#{offer_id}" for offer_id in unknown)
+        raise EditorError(
+            "unknown_offers",
+            f"Офферов {listed} нет в справочнике: либо они не видны этому ключу API, либо удалены "
+            "в Keitaro (отличить нельзя, а трекер примет и несуществующий ID). Подтвердите публикацию, "
+            "если уверены, что офферы существуют.",
+            http_status=409, details={"needs": "allow_unknown_offers", "offer_ids": unknown})
 
     current = _kt_offer_rows(await client.get_stream(stream.keitaro_id))
     expected = [{"offer_id": b.offer_id, "share": b.kt_share or 0, "state": b.kt_state}
@@ -556,8 +661,15 @@ async def push(
             details={"keitaro": _public_rows(current), "expected": _public_rows(expected)})
 
     payload = _push_payload(stream)
-    session.add(StreamSnapshot(stream_id=stream.id, reason="pre_push",
-                               offers=_public_rows(current)))
+    latest = (await session.scalars(
+        select(StreamSnapshot).where(StreamSnapshot.stream_id == stream.id)
+        .order_by(StreamSnapshot.id.desc()).limit(1))).first()
+    if latest is None or latest.offers != _public_rows(current):  # повтор Push не плодит копии
+        session.add(StreamSnapshot(stream_id=stream.id, reason="pre_push",
+                                   offers=_public_rows(current)))
+    # Снимок фиксируем ДО отправки: если PUT применится, а ответ потеряется (таймаут) или окажется
+    # не тем (push_mismatch), трекер уже изменён — и точка отката обязана существовать.
+    await session.commit()
     response = await client.update_stream_offers(stream.keitaro_id, payload)
     published = _kt_offer_rows(response)
     if _signature(published) != _signature(payload):

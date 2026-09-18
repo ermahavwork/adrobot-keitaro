@@ -15,6 +15,8 @@ COPY alembic.ini ./
 COPY alembic ./alembic
 COPY app ./app
 COPY scripts ./scripts
+# Эмулятор Keitaro нужен демо-режиму (scripts/demo_server.py); остальные тесты в образ не идут.
+COPY tests/__init__.py tests/fake_keitaro.py ./tests/
 
 # Не root: приложению нужен только каталог с базой SQLite.
 RUN useradd --create-home --uid 10001 adrobot \

@@ -64,6 +64,8 @@ class KeitaroClient:
         backoff_base: float = 0.4,
     ) -> None:
         self._configured = bool(base_url and api_key)
+        # Ключ, который вырезаем из текстов ошибок; совсем короткий не трогаем — изрежет обычный текст.
+        self._secret = api_key if len(api_key) >= 6 else ""
         self._max_retries = max(0, max_retries)
         self._backoff_base = backoff_base
         self._semaphore = asyncio.Semaphore(max(1, max_concurrency))
@@ -117,12 +119,16 @@ class KeitaroClient:
                        " Запрос на создание мог выполниться — проверьте трекер перед повтором.")
                 )
             except httpx.HTTPError as exc:
+                # Обрыв на чтении ответа (ReadError) случается уже ПОСЛЕ того, как трекер принял
+                # запрос, поэтому для создания предупреждаем так же, как при таймауте.
                 last_error = KeitaroNetworkError(
                     f"Нет связи с Keitaro ({method} {path}): {type(exc).__name__}."
+                    + ("" if idempotent or isinstance(exc, httpx.ConnectError) else
+                       " Запрос на создание мог выполниться — проверьте трекер перед повтором.")
                 )
             else:
                 if response.status_code in _RETRY_STATUSES and attempt < attempts:
-                    last_error = self._error_from_response(response, method, path)
+                    last_error = self._scrub(self._error_from_response(response, method, path))
                     retry_after = self._retry_after(response)
                 else:
                     return self._parse(response, method, path)
@@ -145,9 +151,37 @@ class KeitaroClient:
         except ValueError:
             return 0.0
 
+    def _scrub(self, error: KeitaroError) -> KeitaroError:
+        """Вырезает ключ API из текста и деталей ошибки.
+
+        Прокси или отладочная страница перед трекером могут вернуть в теле ответа заголовки
+        запроса — без этого ключ ушёл бы во фронтенд и в журнал операций.
+        """
+        if self._secret:
+            error.message = self._scrub_value(error.message)
+            error.args = (error.message,)  # str(error) читает args, а не message
+            error.details = self._scrub_value(error.details)
+        return error
+
+    def _scrub_value(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return value.replace(self._secret, "***")
+        if isinstance(value, list):
+            return [self._scrub_value(item) for item in value]
+        if isinstance(value, dict):
+            return {self._scrub_value(k): self._scrub_value(v) for k, v in value.items()}
+        return value
+
     def _parse(self, response: httpx.Response, method: str, path: str) -> Any:
         if response.status_code >= 400:
-            raise self._error_from_response(response, method, path)
+            raise self._scrub(self._error_from_response(response, method, path))
+        if 300 <= response.status_code < 400:
+            # Admin API не перенаправляет. Редирект = перед нами не трекер (страница входа, прокси),
+            # и считать такой ответ успехом нельзя — особенно на DELETE/PUT с пустым телом.
+            raise KeitaroProtocolError(
+                f"Keitaro ответил перенаправлением ({response.status_code}) на {method} {path}. "
+                "Проверьте KEITARO_BASE_URL: это должен быть адрес трекера, а не страницы входа.",
+                upstream_status=response.status_code)
         if not response.content:
             return None
         try:
@@ -188,7 +222,8 @@ class KeitaroClient:
                 upstream_status=status)
         if status == 402:
             return KeitaroForbiddenError(
-                "Keitaro ответил 402: лицензия трекера истекла или не оплачена — API недоступно.",
+                "Keitaro ответил 402: Admin API недоступно — лицензия не оплачена либо в этой "
+                "редакции трекера API не предусмотрено.",
                 upstream_status=status)
         if status == 403:
             return KeitaroForbiddenError(
@@ -258,7 +293,7 @@ class KeitaroClient:
 
     async def list_campaigns(self) -> list[dict[str, Any]]:
         """Все кампании, доступные ключу (постранично: limit/offset)."""
-        result: list[dict[str, Any]] = []
+        unique: dict[int, dict[str, Any]] = {}
         for page in range(_MAX_PAGES):
             chunk = self._expect_list(
                 await self._request(
@@ -266,15 +301,15 @@ class KeitaroClient:
                 ),
                 "кампании",
             )
-            result.extend(chunk)
+            known = len(unique)
+            for row in chunk:
+                if isinstance(row.get("id"), int):
+                    unique.setdefault(row["id"], row)
             # Старые версии Keitaro игнорируют limit и отдают всё сразу — тогда одной страницы
-            # достаточно; повторный запрос вернул бы те же данные.
-            if len(chunk) != _PAGE_SIZE:
+            # достаточно; повторный запрос вернул бы те же данные. Страница без единой новой
+            # кампании значит, что трекер игнорирует и offset: дальше пойдут те же строки.
+            if len(chunk) != _PAGE_SIZE or len(unique) == known:
                 break
-        unique: dict[int, dict[str, Any]] = {}
-        for row in result:
-            if isinstance(row.get("id"), int):
-                unique.setdefault(row["id"], row)
         return list(unique.values())
 
     async def get_campaign(self, campaign_id: int) -> dict[str, Any]:

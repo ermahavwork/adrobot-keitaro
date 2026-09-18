@@ -2,10 +2,13 @@
 // FETCH STREAMS FROM KT → ADD / REMOVE / BRING BACK / pin → поток «жёлтый» → PUSH TO KT или CANCEL.
 // Каждая кнопка — один вызов API; сервер возвращает свежий вид потока, мы его перерисовываем.
 
-import { api } from "../api.js";
+import { api, session } from "../api.js";
 import { h, icon, mount, fmtDate } from "../dom.js";
 import { autocomplete, confirmDialog, dialog, reportError, segmentColor, shareBar, sparkline,
   toast, withBusy } from "../ui.js";
+import { openAdvisor } from "./advisor.js";
+
+const STALE_AFTER_MS = 2 * 60 * 1000; // открыли кампанию позже — тихо перечитываем её из Keitaro
 
 const PERIODS = [["today", "сегодня"], ["7d", "7 дней"], ["30d", "30 дней"]];
 const DIFF_TEXT = {
@@ -27,7 +30,13 @@ export async function renderEditor(container, campaignId) {
 
   async function load({ autoFetch = false } = {}) {
     state.campaign = await api("GET", `/api/campaigns/${campaignId}`);
-    if (autoFetch && !state.campaign.streams_fetched_at && !state.campaign.is_deleted) {
+    const fetchedAt = state.campaign.streams_fetched_at ? Date.parse(state.campaign.streams_fetched_at) : 0;
+    const stale = Date.now() - fetchedAt > STALE_AFTER_MS;
+    // Фоновой синхронизации нет, поэтому при открытии подтягиваем свежее состояние сами.
+    // Черновик при этом не теряется: Fetch по умолчанию его сохраняет.
+    // С токеном «только чтение» Fetch запрещён (он пишет в базу AdRobot) — показываем что есть.
+    if (autoFetch && stale && !state.campaign.is_deleted && !session.readOnly) {
+      paint();
       await fetchStreams(null, { silent: true });
     }
     paint();
@@ -45,7 +54,9 @@ export async function renderEditor(container, campaignId) {
 
   async function fetchStreams(button, { silent = false, discardDraft = false } = {}) {
     const run = async () => {
-      const data = await api("POST", `/api/campaigns/${campaignId}/fetch`, { discard_draft: discardDraft });
+      // auto: фоновое обновление при открытии — в журнал оно попадёт, только если что-то изменилось
+      const data = await api("POST", `/api/campaigns/${campaignId}/fetch`,
+        { discard_draft: discardDraft, auto: silent });
       state.campaign = data.campaign;
       if (!silent) {
         const archived = data.result.archived_offers.length;
@@ -74,7 +85,39 @@ export async function renderEditor(container, campaignId) {
   }
 
   /** Общая обёртка правок потока: вызвать API, подменить поток в состоянии, перерисовать. */
+  // --- фокус клавиатуры. paint() пересобирает экран целиком, и без этого после каждой кнопки
+  // фокус падал бы в начало страницы: с клавиатуры редактором было бы не поработать.
+  const FOCUSABLE = "button:not([disabled]), input:not([disabled]), select:not([disabled]), a[href]";
+  let pendingFocus = null;
+
+  function rememberFocus(element = document.activeElement) {
+    if (!element || !container.contains(element)) return null;
+    const scopes = [];
+    for (let node = element.closest("[data-focus-scope]"); node;
+      node = node.parentElement ? node.parentElement.closest("[data-focus-scope]") : null) {
+      scopes.push(node.dataset.focusScope);
+    }
+    const scope = element.closest("[data-focus-scope]");
+    return { scopes, className: element.className,
+      index: scope ? [...scope.querySelectorAll(FOCUSABLE)].indexOf(element) : -1 };
+  }
+
+  function restoreFocus(memo) {
+    if (!memo || (document.activeElement && document.activeElement.closest(".modal"))) return;
+    for (const [depth, name] of memo.scopes.entries()) {
+      const scope = container.querySelector(`[data-focus-scope="${name}"]`);
+      if (!scope) continue; // строки больше нет (оффер убран совсем) — ищем в карточке потока
+      const items = [...scope.querySelectorAll(FOCUSABLE)];
+      const sameSpot = depth === 0 && items[memo.index] && items[memo.index].className === memo.className
+        ? items[memo.index] : null;
+      const target = sameSpot || (depth === 0 && items.find((item) => item.className === memo.className)) || items[0];
+      if (target) { target.focus({ preventScroll: true }); return; }
+    }
+  }
+
   async function mutate(button, method, path, body, okMessage) {
+    // Запоминаем до запроса: занятая кнопка выключается, и браузер снимает с неё фокус.
+    pendingFocus = rememberFocus(button || document.activeElement);
     try {
       await withBusy(button, async () => {
         const stream = await api(method, path, body);
@@ -114,6 +157,10 @@ export async function renderEditor(container, campaignId) {
       });
       if (choice === "fetch") await fetchStreams(null);
       if (choice === "force") await push(button, stream, { ...extra, force: true });
+    } else if (error.code === "unknown_offers") {
+      const sure = await confirmDialog("Опубликовать оффер, которого нет в справочнике?", error.message,
+        "Оффер существует, опубликовать", "danger");
+      if (sure) await push(button, stream, { ...extra, allow_unknown_offers: true });
     } else if (error.code === "empty_stream") {
       const sure = await confirmDialog("Опубликовать поток без офферов?",
         "После публикации в потоке не останется ни одного активного оффера — трафику будет некуда идти.",
@@ -128,7 +175,7 @@ export async function renderEditor(container, campaignId) {
     let snapshots = [];
     try { snapshots = await api("GET", `/api/streams/${stream.id}/snapshots`); }
     catch (error) { reportError(error); return; }
-    const body = snapshots.length ? snapshots.map((snap) => h("div", { class: "banner" },
+    const body = (close) => (snapshots.length ? snapshots.map((snap) => h("div", { class: "banner" },
       h("div", { class: "row" },
         h("strong", { class: "grow" }, `Перед публикацией ${fmtDate(snap.created_at)}`),
         h("button", { class: "btn btn--sm", onclick: async (event) => {
@@ -136,12 +183,12 @@ export async function renderEditor(container, campaignId) {
             `/api/streams/${stream.id}/snapshots/${snap.id}/restore`, undefined,
             "Снимок загружен в черновик. Проверьте доли и нажмите Push to KT.");
           if (error) reportError(error);
-          document.querySelector(".modal-backdrop")?.remove();
+          close(null);
         } }, icon("undo"), "Вернуть в черновик")),
       h("div", { class: "small muted" }, snap.offers.length
         ? snap.offers.map((o) => `[${o.offer_id}] ${o.offer_name} — ${o.share}%`).join(" · ")
         : "поток был пуст")))
-      : h("p", { class: "muted" }, "Снимков пока нет: они создаются автоматически перед каждым Push.");
+      : h("p", { class: "muted" }, "Снимков пока нет: они создаются автоматически перед каждым Push."));
     await dialog({ title: `История потока «${stream.name}»`, wide: true, body,
       actions: [{ label: "Закрыть", value: null }] });
   }
@@ -232,7 +279,8 @@ export async function renderEditor(container, campaignId) {
         if (error) reportError(error);
       } }, icon("trash"), "Remove");
 
-    return h("tr", { class: [removed ? "offer--removed" : "", offer.change === "add" ? "offer--added" : ""] },
+    return h("tr", { class: [removed ? "offer--removed" : "", offer.change === "add" ? "offer--added" : ""],
+      "data-focus-scope": `offer-${stream.id}-${offer.id}` },
       h("td", {},
         h("span", { class: "offer__swatch", style: `background:${colorFor(offer.offer_id)}` }),
         h("span", { class: "offer__id" }, `[${offer.offer_id}]`),
@@ -262,6 +310,15 @@ export async function renderEditor(container, campaignId) {
       h("span", { class: "stream__name" }, `Stream: ${stream.name || "без названия"}`),
       h("span", { class: "stream__meta mono" }, meta),
       h("span", { class: "stream__state" },
+        stream.supports_offers && !stream.is_deleted ? h("button", { class: "btn btn--sm btn--quiet",
+          title: "Предложить доли по статистике. Ничего не публикует: цифры попадут в черновик только по вашей кнопке",
+          onclick: () => openAdvisor(stream, state.period, (fresh) => {
+            const index = state.campaign.streams.findIndex((s) => s.id === fresh.id);
+            state.campaign.streams[index] = fresh;
+            state.campaign.is_dirty = state.campaign.streams.some((s) => s.is_dirty);
+            toast("Доли из совета лежат в черновике. Проверьте и нажмите Push to KT.");
+            paint();
+          }) }, "Советник") : null,
         stream.supports_offers ? h("button", { class: "btn btn--sm btn--quiet", title: "Снимки перед публикациями и откат",
           onclick: () => openHistory(stream) }, icon("history"), "История") : null,
         h("span", { class: `lamp lamp--${lamp[0]}`, "aria-hidden": "true" }), lamp[1]));
@@ -291,8 +348,9 @@ export async function renderEditor(container, campaignId) {
           const [sign, text] = DIFF_TEXT[change.type](change, `[${change.offer_id}] ${names.get(change.offer_id) || ""}`);
           return h("li", {}, h("span", { class: "diff__sign" }, sign), text);
         }))),
-      h("button", { class: "btn btn--primary", disabled: stream.problems.length > 0,
-        title: stream.problems.length ? "Сначала исправьте доли" : "Отправить черновик в Keitaro",
+      // Пустой поток — не ошибка долей: Push доступен, но сервер попросит отдельное подтверждение.
+      h("button", { class: "btn btn--primary", disabled: stream.problems.length > 0 && stream.active_count > 0,
+        title: stream.problems.length && stream.active_count ? "Сначала исправьте доли" : "Отправить черновик в Keitaro",
         onclick: (event) => push(event.currentTarget, stream) }, icon("upload"), "Push to KT"),
       h("button", { class: "btn", title: "Выбросить неопубликованные изменения",
         onclick: async (event) => {
@@ -303,12 +361,13 @@ export async function renderEditor(container, campaignId) {
 
     const problems = stream.problems.length ? h("div", { class: "problems" },
       h("div", { class: "problems__text" }, stream.problems.join(" ")),
-      h("button", { class: "btn btn--sm", title: "Поделить свободный остаток между незакреплёнными",
+      // В пустом потоке делить нечего: остаются Add, Bring back, Cancel — кнопки пересчёта прячем.
+      !stream.active_count ? null : h("button", { class: "btn btn--sm", title: "Поделить свободный остаток между незакреплёнными",
         onclick: async (event) => {
           const error = await mutate(event.currentTarget, "POST", `/api/streams/${stream.id}/recalculate`, { drop_pins: false });
           if (error) reportError(error);
         } }, "Пересчитать"),
-      h("button", { class: "btn btn--sm", title: "Снять все закрепления и поделить 100% поровну",
+      !stream.active_count ? null : h("button", { class: "btn btn--sm", title: "Снять все закрепления и поделить 100% поровну",
         onclick: async (event) => {
           const error = await mutate(event.currentTarget, "POST", `/api/streams/${stream.id}/recalculate`, { drop_pins: true });
           if (error) reportError(error);
@@ -332,7 +391,8 @@ export async function renderEditor(container, campaignId) {
     } }, icon("plus"), "Add");
 
     const total = stream.total_share;
-    return h("section", { class: ["card", "stream", stream.problems.length ? "stream--problem" : stream.is_dirty ? "stream--draft" : ""] },
+    return h("section", { class: ["card", "stream", stream.problems.length ? "stream--problem" : stream.is_dirty ? "stream--draft" : ""],
+      "data-focus-scope": `stream-${stream.id}` },
       head, draftBar, problems,
       h("div", { class: "sharebar-wrap" },
         shareBar(draftRows, { label: stream.is_dirty ? "Черновик" : "Доли офферов" }),
@@ -347,12 +407,21 @@ export async function renderEditor(container, campaignId) {
         h("tbody", {}, visible.length ? visible.map((offer) => offerRow(stream, offer))
           : h("tr", {}, h("td", { colspan: "5", class: "empty" }, "В потоке нет офферов. Добавьте первый ниже."))))),
       hiddenCount ? h("div", { class: "stream__summary muted" }, `В архиве скрыто офферов: ${hiddenCount}`) : null,
-      h("div", { class: "addrow" }, adder.root, addButton));
+      h("div", { class: "addrow" }, adder.root, addButton,
+        h("button", { class: "btn btn--quiet", title: "Перечитать справочник офферов из Keitaro (если нужного оффера нет в поиске)",
+          onclick: async (event) => {
+            try {
+              const data = await withBusy(event.currentTarget, () => api("POST", "/api/offers/refresh"));
+              toast(`Справочник офферов обновлён: ${data.offers}.`);
+            } catch (error) { reportError(error); }
+          } }, icon("refresh"), "Обновить офферы")));
   }
 
   function paint() {
+    const focusMemo = pendingFocus || rememberFocus();
+    pendingFocus = null;
     const c = state.campaign;
-    const head = h("div", { class: "page-head" },
+    const head = h("div", { class: "page-head", "data-focus-scope": "head" },
       h("div", { class: "page-head__title" },
         h("div", { class: "crumbs" }, h("a", { href: "#/campaigns" }, "Кампании"), " / ", c.name, " / Keitaro Streams"),
         h("h1", {}, c.name),
@@ -375,6 +444,8 @@ export async function renderEditor(container, campaignId) {
         PERIODS.map(([value, label]) => h("option", { value, selected: value === state.period }, `Stats: ${label}`)))));
 
     const notices = [
+      session.readOnly ? h("div", { class: "banner banner--warn small" },
+        "Ваш токен — только для чтения: кампании и доли видны, а Fetch, правки и Push вернут отказ.") : null,
       c.is_deleted ? h("div", { class: "banner banner--error" }, "Кампании больше нет в Keitaro (удалена или в архиве). Редактирование недоступно.") : null,
       state.stats && state.stats.available === false && state.stats.reason
         ? h("div", { class: "banner small muted" }, `Статистика недоступна: ${state.stats.reason}`) : null,
@@ -388,16 +459,18 @@ export async function renderEditor(container, campaignId) {
           "Нажмите «Fetch streams from KT», чтобы забрать их из Keitaro."),
       h("div", { class: "row", style: "justify-content:flex-end" },
         h("button", { class: "btn btn--danger btn--sm", disabled: c.is_deleted, onclick: async (event) => {
+          const button = event.currentTarget; // после await у события currentTarget уже пуст
           const sure = await confirmDialog("Отправить кампанию в архив Keitaro?",
             `«${c.name}» (#${c.keitaro_id}) перестанет принимать трафик. Восстановить можно из архива в админке Keitaro.`,
             "В архив", "danger");
           if (!sure) return;
           try {
-            await withBusy(event.currentTarget, () => api("DELETE", `/api/campaigns/${campaignId}`));
+            await withBusy(button, () => api("DELETE", `/api/campaigns/${campaignId}`));
             toast("Кампания отправлена в архив Keitaro.");
             location.hash = "#/campaigns";
           } catch (error) { reportError(error); }
         } }, icon("trash"), "Кампанию в архив"))));
+    restoreFocus(focusMemo);
   }
 
   try {

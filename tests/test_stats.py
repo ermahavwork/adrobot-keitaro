@@ -205,29 +205,30 @@ class TestSameRowsForBothRequests:
 
 
 class TestPeriods:
-    @pytest.mark.parametrize(("period", "interval", "days_count"), [
-        ("today", "today", 1), ("7d", "7_days_ago", 7), ("30d", "1_month_ago", 30)])
-    def test_period_maps_to_keitaro_interval(self, editor, period, interval, days_count):
+    @pytest.mark.parametrize(("period", "days_count"), [("today", 1), ("7d", 7), ("30d", 30)])
+    def test_period_maps_to_explicit_dates(self, editor, period, days_count):
+        """Итоги и тренд запрашиваются за ОДНИ И ТЕ ЖЕ даты (интервал Keitaro вида 7_days_ago
+        захватывал бы лишний день, и сумма тренда не сходилась бы с итогом)."""
         editor.fake.requests.clear()
         today = day(0)
         body = stats(editor, period=period)
         assert body["period"] == period and len(body["days"]) == days_count
         assert body["days"][-1] >= today and body["days"] == sorted(set(body["days"]))
         assert [r["range"] for r in report_requests(editor.fake)] == \
-            [{"interval": interval, "timezone": "UTC"}] * 2
+            [{"from": body["days"][0], "to": body["days"][-1], "timezone": "UTC"}] * 2
 
     def test_week_is_the_default(self, editor):
         editor.fake.requests.clear()
         body = stats(editor)
         assert body["period"] == "7d" and len(body["days"]) == 7
-        assert report_requests(editor.fake)[0]["range"]["interval"] == "7_days_ago"
+        assert report_requests(editor.fake)[0]["range"]["from"] == body["days"][0]
 
     @pytest.mark.parametrize("period", ["мусор", "", "7D", "365d", "<script>", "1_year_ago"])
     def test_unknown_period_falls_back_to_week(self, editor, period):
         editor.fake.requests.clear()
         body = stats(editor, period=period)
         assert body["available"] is True and len(body["days"]) == 7
-        assert {r["range"]["interval"] for r in report_requests(editor.fake)} == {"7_days_ago"}
+        assert {r["range"]["from"] for r in report_requests(editor.fake)} == {body["days"][0]}
 
     def test_trend_length_follows_the_period(self, editor):
         flow2, long_ago = editor.kt_stream_id, day(28)
@@ -286,17 +287,21 @@ class TestReportsUnavailable:
         editor.fake.fail_next("POST", REPORT, status=403, body=editor.fake.cloudflare_body())
         assert "Cloudflare" in stats(editor)["reason"]
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "app/services/stats.py:_number пропускает nan/inf: float('NaN') и float('1e999') не "
-        "бросают исключений, а следом int(nan)/int(inf) падает с ValueError/OverflowError → 500 "
-        "internal_error; nan в revenue/cr/epc уходит во фронтенд как null. Модуль обещает, что "
-        "статистика никогда не роняет редактор. Правка: в _number возвращать 0.0, если "
-        "not math.isfinite(value)."))
-    @pytest.mark.parametrize(("field", "value"), [("clicks", "NaN"), ("clicks", "1e999"),
-                                                  ("conversions", "-inf"), ("revenue", "nan")])
+    @pytest.mark.parametrize(("field", "value"), [
+        ("clicks", "NaN"), ("clicks", "1e999"), ("clicks", "Infinity"), ("conversions", "-inf"),
+        ("revenue", "nan"), ("cr", "inf"), ("epc", "-Infinity"), ("clicks", 10**400),
+    ])
     def test_not_finite_numbers_do_not_crash_stats(self, editor, field, value):
+        # Регрессия: float("NaN") и float("1e999") не бросают исключений, а int(nan)/int(inf)
+        # падал → 500; nan в revenue/cr/epc уходил во фронтенд как null.
         flow2 = editor.kt_stream_id
         feed(editor.fake, totals=[{"stream_id": flow2, "offer_id": A_0009, "clicks": 1,
                                    field: value}], trend=[])
         body = stats(editor)
         assert body["offers"][f"{flow2}:{A_0009}"][field] == 0
+
+    def test_not_finite_clicks_in_trend_are_zero(self, editor):
+        flow2, today = editor.kt_stream_id, day(0)
+        feed(editor.fake, totals=[{"stream_id": flow2, "offer_id": A_0009, "clicks": 1}],
+             trend=[{"day": today, "stream_id": flow2, "offer_id": A_0009, "clicks": "NaN"}])
+        assert stats(editor)["offers"][f"{flow2}:{A_0009}"]["trend"] == [0] * 7

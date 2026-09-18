@@ -9,6 +9,8 @@ const ACTIONS = {
   remove_offer: "Remove", bring_back: "Bring back", pin: "Pin", unpin: "Unpin", set_share: "Доля вручную",
   recalculate: "Пересчёт долей", equalize: "Выравнивание долей", push: "Push to KT", cancel: "Cancel",
   restore_snapshot: "Откат к снимку", forget_offer: "Удаление из архива", archive_campaign: "Кампания в архив",
+  bulk_add_offer: "Массовое добавление", push_many: "Публикация пачкой", sync_all: "Синхронизация всех",
+  apply_shares: "Доли от советника",
 };
 
 export async function renderLog(container) {

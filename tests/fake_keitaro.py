@@ -34,10 +34,10 @@ class FakeKeitaro:
         self.requests: list[tuple[str, str, Any]] = []
         self._failures: list[dict[str, Any]] = []
         self.domains_visible = True
-        self.groups = [{"id": 4970, "name": "FORTESTS", "position": 1, "type": "campaigns"}]
+        self.groups = [{"id": 22, "name": "FORTESTS", "position": 1, "type": "campaigns"}]
         self.sources = [
             {
-                "id": 473,
+                "id": 33,
                 "name": "FORTESTS",
                 "state": "active",
                 "template_name": "facebook",
@@ -48,7 +48,7 @@ class FakeKeitaro:
                 },
             }
         ]
-        self.domains = [{"id": 4622, "name": "https://in.example.test/", "state": "active"}]
+        self.domains = [{"id": 11, "name": "https://in.example.test/", "state": "active"}]
         self.offers: dict[int, dict[str, Any]] = {}
         self.campaigns: dict[int, dict[str, Any]] = {}
         self.streams: dict[int, dict[str, Any]] = {}
@@ -80,8 +80,8 @@ class FakeKeitaro:
     ) -> tuple[int, int, int]:
         """Эталон из видео: Flow 1 (AU → google) и Flow 2 с офферами. -> (campaign, flow1, flow2)."""
         campaign = self._create_campaign(
-            {"name": name, "alias": f"alias{next(self._ids)}", "group_id": 4970,
-             "traffic_source_id": 473, "domain_id": 4622}
+            {"name": name, "alias": f"alias{next(self._ids)}", "group_id": 22,
+             "traffic_source_id": 33, "domain_id": 11}
         )
         flow1 = self._create_stream(
             {"campaign_id": campaign["id"], "name": "Flow 1", "position": 1, "schema": "redirect",

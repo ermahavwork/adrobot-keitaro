@@ -24,7 +24,7 @@ from tests.fake_keitaro import API_KEY, FakeKeitaro
 
 TOKEN = "fake-tok"  # не секрет: токен тестового приложения
 BEARER = {"Authorization": f"Bearer {TOKEN}"}
-LOG_SECRET = "kt-key-0123456789abcdef"  # не секрет: приметная строка для поиска в логах  # gitleaks:allow  # noqa: E501
+LOG_SECRET = "fake-secret-0123456789abcdef"  # не секрет: приметная строка для поиска в логах  # gitleaks:allow  # noqa: E501
 OFFER = 3749
 EVIL_NAME = "<script>alert(1)</script>\"'><img src=x onerror=alert(1)>"
 
@@ -143,11 +143,11 @@ class TestSecurityHeaders:
         assert "unsafe-inline" not in CSP_APP and "unsafe-eval" not in CSP_APP
         assert "http:" not in CSP_APP and "https:" not in CSP_APP and "*" not in CSP_APP
 
-    @pytest.mark.parametrize("path", ["/docs", "/redoc", "/openapi.json"])
+    @pytest.mark.parametrize("path", ["/docs", "/openapi.json"])
     def test_swagger_pages_do_not_get_our_csp(self, client, path):
         response = client.get(path)
         assert response.status_code == 200
-        assert "Content-Security-Policy" not in response.headers, "Swagger грузит скрипты с CDN"
+        assert "Content-Security-Policy" not in response.headers, "Swagger UI — inline-скрипт"
         assert response.headers["X-Content-Type-Options"] == "nosniff"
         assert response.headers["X-Frame-Options"] == "DENY"
 
@@ -253,12 +253,12 @@ class TestLogRedaction:
         assert LOG_SECRET not in text
 
     @pytest.mark.parametrize("line", [
-        "api_key=abc123XYZ", "Api-Key: abc123XYZ", "'api-key': 'abc123XYZ'",
-        "APIKEY=abc123XYZ", "Authorization: Bearer abc123XYZ", "authorization=abc123XYZ",
+        "api_key=fakeVALUE123", "Api-Key: fakeVALUE123", "'api-key': 'fakeVALUE123'",
+        "APIKEY=fakeVALUE123", "Authorization: Bearer fakeVALUE123", "authorization=fakeVALUE123",
     ])
     def test_unknown_secret_is_cut_by_key_value_pattern(self, line):
         text = render_log(lambda log: log.info("outgoing %s done", line), [])
-        assert "abc123XYZ" not in text and "***" in text and text.rstrip().endswith("done")
+        assert "fakeVALUE123" not in text and "***" in text and text.rstrip().endswith("done")
 
     def test_short_or_empty_secrets_do_not_shred_the_log(self):
         text = render_log(lambda log: log.info("кампания создана, оффер 3749"), ["", "а", "3749"])
@@ -297,14 +297,9 @@ class TestLogRedaction:
             assert setup_filters, "create_app вешает фильтр на обработчики корневого логгера"
             assert setup_filters[0].redact(f"{LOG_SECRET} / {TOKEN}") == "*** / ***"
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "app/logging_conf.py:SecretRedactingFilter.filter чистит только msg/args. Текст "
-        "исключения и traceback (record.exc_info → exc_text) форматтер дописывает уже после "
-        "фильтра, поэтому logger.exception(...) из app/main.py:_unexpected и "
-        "creator._compensate печатает секрет как есть — вопреки docstring модуля. Правка: в "
-        "filter() при record.exc_info заранее собрать record.exc_text и прогнать через redact "
-        "(то же для stack_info)."))
     def test_secret_inside_traceback_is_redacted_too(self):
+        # Регрессия: текст исключения форматтер дописывает ПОСЛЕ фильтра, и logger.exception(...)
+        # печатал секрет как есть.
         def emit(log: logging.Logger) -> None:
             try:
                 raise RuntimeError(f"request failed, headers={{'Api-Key': '{LOG_SECRET}'}}")
@@ -313,7 +308,44 @@ class TestLogRedaction:
 
         text = render_log(emit, [LOG_SECRET])
         assert "необработанная ошибка" in text
-        assert LOG_SECRET not in text
+        assert "Traceback (most recent call last)" in text and "RuntimeError" in text
+        assert LOG_SECRET not in text and "***" in text
+
+    def test_secret_inside_chained_exception_is_redacted(self):
+        def emit(log: logging.Logger) -> None:
+            try:
+                try:
+                    raise ValueError(f"inner cause with {LOG_SECRET}")
+                except ValueError as inner:
+                    raise RuntimeError("outer failure") from inner
+            except RuntimeError:
+                log.error("сбой", exc_info=True)
+
+        text = render_log(emit, [LOG_SECRET])
+        assert "inner cause with ***" in text and LOG_SECRET not in text
+
+    def test_secret_inside_stack_info_is_redacted(self):
+        def emit(log: logging.Logger) -> None:
+            marker = f"local value {LOG_SECRET}"
+            log.warning("где мы: %s", len(marker), stack_info=True)
+
+        record_text = render_log(emit, [LOG_SECRET])
+        assert "Stack (most recent call last)" in record_text
+        assert LOG_SECRET not in record_text
+
+    def test_traceback_without_secrets_is_left_as_is(self):
+        def emit(log: logging.Logger) -> None:
+            try:
+                raise KeyError("offer_id")
+            except KeyError:
+                log.exception("нет поля")
+
+        text = render_log(emit, [LOG_SECRET])
+        assert text.rstrip().endswith("KeyError: 'offer_id'")
+
+    def test_exception_logged_outside_except_block_does_not_crash(self):
+        text = render_log(lambda log: log.exception("нет активного исключения"), [LOG_SECRET])
+        assert "нет активного исключения" in text
 
 
 class TestSettingsNormalization:
@@ -348,7 +380,7 @@ class TestSettingsNormalization:
         assert settings.admin_url == "https://tracker.example.com/admin/"
         assert settings.campaign_admin_url(42) == "https://tracker.example.com/admin/#!/campaigns/42"
 
-    @pytest.mark.parametrize(("raw", "expected"), [("", None), ("   ", None), ("4622", 4622)])
+    @pytest.mark.parametrize(("raw", "expected"), [("", None), ("   ", None), ("11", 11)])
     def test_blank_default_ids_from_env_mean_auto(self, raw, expected):
         settings = Settings(_env_file=None, default_domain_id=raw, default_group_id=raw,
                             default_traffic_source_id=raw)
@@ -361,21 +393,46 @@ class TestSettingsNormalization:
         for text in (repr(settings), str(settings), settings.model_dump_json()):
             assert LOG_SECRET not in text and TOKEN not in text
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "app/config.py:_strip_url — комментарий обещает разбирать «адрес админки целиком», но "
-        "срезаются только хвосты без маршрута. Адрес из строки браузера "
-        "(…/admin/#!/campaigns) остаётся как есть → base_url клиента получает фрагмент, все "
-        "запросы уходят на /admin/ и возвращают HTML. Схема в верхнем регистре даёт "
-        "https://HTTPS://…. Правка: urlsplit → взять scheme.lower()+netloc, отрезать путь "
-        "начиная с /admin или /admin_api и весь fragment."))
     @pytest.mark.parametrize("raw", [
         "https://tracker.example.com/admin/#!/campaigns",
         "https://tracker.example.com/admin/#!/campaigns/1234",
-        "HTTPS://tracker.example.com",
+        "https://tracker.example.com/admin/?object=campaigns.list",
+        "https://tracker.example.com/admin/?object=campaigns.list#!/streams/5",
+        "https://tracker.example.com/admin_api/v1/campaigns?limit=500",
+        "https://tracker.example.com?utm=1#top",
+        "HTTPS://tracker.example.com", "Https://tracker.example.com/admin",
+        "https://tracker.example.com /admin", "\thttps://tracker.example.com/admin/\n",
+        "//tracker.example.com/admin", "ftp://tracker.example.com",
     ])
     def test_address_copied_from_browser_is_normalized(self, raw):
+        # Регрессия: …/admin/#!/campaigns оставался как есть (запросы уходили на /admin/ и
+        # возвращали HTML), а схема в верхнем регистре давала https://HTTPS://….
         assert Settings(_env_file=None, keitaro_base_url=raw).keitaro_base_url == \
             "https://tracker.example.com"
+
+    @pytest.mark.parametrize(("raw", "expected"), [
+        ("https://host.example.com/kt", "https://host.example.com/kt"),
+        ("https://host.example.com/kt/", "https://host.example.com/kt"),
+        ("https://host.example.com/kt/admin/#!/campaigns/7", "https://host.example.com/kt"),
+        ("host.example.com:8443/kt/admin_api/v1", "https://host.example.com:8443/kt"),
+        ("http://10.0.0.5:8080/admin/?object=x", "http://10.0.0.5:8080"),
+        ("localhost:8080", "https://localhost:8080"),
+        ("https://in.example.com/go", "https://in.example.com/go"),
+    ])
+    def test_custom_base_path_and_port_are_kept(self, raw, expected):
+        assert Settings(_env_file=None, keitaro_base_url=raw).keitaro_base_url == expected
+
+    @pytest.mark.parametrize("raw", ["https://", "http:///admin", "://", "https:///"])
+    def test_address_without_host_means_not_configured(self, raw):
+        settings = Settings(_env_file=None, keitaro_base_url=raw, keitaro_api_key=SecretStr("k"))
+        assert settings.keitaro_base_url == "" and settings.keitaro_configured is False
+
+    def test_client_really_talks_to_normalized_address(self, fake, tmp_path):
+        with running_app(fake, tmp_path,
+                         keitaro_base_url="https://tracker.test/admin/#!/campaigns/15") as app:
+            assert app.get("/api/health").json()["keitaro"]["reachable"] is True
+            assert app.get("/api/health").json()["admin_url"] == "https://tracker.test/admin/"
+        assert [r[:2] for r in fake.requests] == [("GET", "/groups")] * 2
 
 
 def create(client: TestClient, **body):
@@ -487,27 +544,40 @@ class TestInputHardening:
         response = client.put("/api/settings", json=body)
         assert response.status_code == 422 and response.json()["error"]["code"] == "validation"
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "Целые числа не ограничены сверху: app/schemas.py (offer_id/offer_ids, AddOfferRequest) и "
-        "path/query-параметры в app/api/routes_*.py принимают 2**63 и больше, sqlite3 падает с "
-        "OverflowError «Python int too large to convert to SQLite INTEGER» → 500 internal_error "
-        "вместо 422/404 (достаточно вставить в поле ID 20-значное число). Правка: le=2**31-1 (или "
-        "2**63-1) в Field/Path/Query либо общий обработчик OverflowError → 422."))
     @pytest.mark.parametrize(("method", "path", "body"), [
         ("POST", "/api/campaigns", {"name": "Big", "geo": "AU", "offer_id": 2**63}),
+        ("POST", "/api/campaigns", {"name": "Big", "geo": "AU", "offer_ids": [OFFER, 2**63]}),
+        ("POST", "/api/campaigns", {"name": "Big", "geo": "AU", "offer_id": OFFER,
+                                    "domain_id": 2**31}),
+        ("POST", "/api/campaigns", {"name": "Big", "geo": "AU", "offer_id": OFFER,
+                                    "group_id": 10**30, "traffic_source_id": 10**30}),
         ("POST", "/api/streams/{stream}/offers", {"offer_id": 2**63}),
+        ("PUT", "/api/settings", {"default_group_id": 10**30}),
         ("GET", f"/api/campaigns/{2**63}", None),
+        ("POST", f"/api/campaigns/{2**63}/fetch", None),
+        ("DELETE", f"/api/campaigns/{2**63}", None),
         ("GET", f"/api/streams/{2**63}", None),
+        ("DELETE", "/api/streams/{stream}/offers/" + str(2**63), None),
         ("POST", f"/api/campaigns/open/{2**63}", None),
         ("GET", f"/api/operations?keitaro_campaign_id={2**63}", None),
-    ], ids=["create-offer-id", "add-offer-id", "campaign-id", "stream-id", "open-id",
-            "journal-filter"])
+    ], ids=["create-offer-id", "create-offer-ids", "create-domain-id", "create-group-source",
+            "add-offer-id", "settings-id", "campaign-id", "fetch-id", "archive-id", "stream-id",
+            "binding-id", "open-id", "journal-filter"])
     def test_huge_integers_are_client_errors_not_500(self, fake, tmp_path, method, path, body):
+        # Регрессия: 2**63 доходило до sqlite3 → OverflowError → 500 internal_error.
         with running_app(fake, tmp_path, raise_server_exceptions=False) as lenient:
             editor = Editor(lenient, fake, *fake.seed_campaign()[::2])
             url = path.format(stream=editor.stream["id"])
+            fake.requests.clear()
             response = lenient.request(method, url, json=body)
         assert response.status_code in (404, 422), response.text
+        assert response.json()["error"]["code"] in ("validation", "binding_not_found")
+        assert not [r for r in fake.requests if r[0] != "GET"], "в Keitaro ничего не записано"
+
+    def test_biggest_allowed_id_is_still_a_normal_request(self, client, fake):
+        response = create(client, offer_id=2_147_483_647)
+        assert response.status_code == 422
+        assert "не найден" in response.json()["error"]["message"], "дошло до проверки оффера"
 
 
 class TestActorHeader:
@@ -545,6 +615,11 @@ class TestActorHeader:
         response = client.post("/api/campaigns/import", headers={"X-AdRobot-User": raw})
         assert response.status_code == 200
         assert len(self.last_actor(client)) <= 64
+
+    def test_frontend_cuts_the_name_before_encoding_it(self):
+        source = (WEB_DIR / "static" / "js" / "api.js").read_text(encoding="utf-8")
+        assert "X-AdRobot-User" in source, "заголовок по-прежнему ставит api.js"
+        assert not re.search(r"encodeURIComponent\([^)]*\)\s*\.slice\(", source)
 
     def test_markup_in_name_is_kept_as_text(self, client):
         client.post("/api/campaigns/import", headers={"X-AdRobot-User": quote(EVIL_NAME)})

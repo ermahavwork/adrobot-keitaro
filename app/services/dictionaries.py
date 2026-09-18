@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import time
 from collections import Counter
@@ -20,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy import or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings
@@ -71,15 +73,31 @@ class DictionaryService:
         self._client = client
         self._settings = settings
         self._lookups: Lookups | None = None
-        self._offers_loaded_at = 0.0
+        # None = офферы ещё не загружали. Нулём помечать нельзя: time.monotonic() отсчитывается
+        # от старта машины, и при аптайме меньше TTL «ноль» выглядел бы свежей загрузкой.
+        self._offers_loaded_at: float | None = None
+        # Справочник офферов обновляет один запрос за раз: два одновременных обновления вставляли
+        # одни и те же новые офферы, и второе падало на первичном ключе (IntegrityError → 500).
+        self._offers_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ офферы
 
+    def _offers_fresh(self) -> bool:
+        loaded_at = self._offers_loaded_at
+        return (loaded_at is not None
+                and time.monotonic() - loaded_at < self._settings.dictionary_ttl_seconds)
+
     async def refresh_offers(self, session: AsyncSession, *, force: bool = False) -> int:
         """Обновляет кэш офферов из Keitaro, если он устарел. Возвращает число офферов."""
-        fresh = time.monotonic() - self._offers_loaded_at < self._settings.dictionary_ttl_seconds
-        if fresh and not force:
+        if self._offers_fresh() and not force:
             return -1
+        async with self._offers_lock:
+            # Пока ждали очередь, справочник мог обновить соседний запрос.
+            if self._offers_fresh() and not force:
+                return -1
+            return await self._load_offers(session)
+
+    async def _load_offers(self, session: AsyncSession) -> int:
         rows = await self._client.list_offers()
         now = utcnow()
         known = {o.keitaro_id: o for o in (await session.scalars(select(Offer))).all()}
@@ -211,14 +229,33 @@ class DictionaryService:
         return {row.key: row.value for row in rows if row.value not in (None, "")}
 
     async def save_overrides(self, session: AsyncSession, values: dict[str, Any]) -> None:
-        for key, value in values.items():
-            if key not in SETTING_KEYS:
-                continue
-            row = await session.get(AppSetting, key) or AppSetting(key=key)
-            row.value = value
-            row.updated_at = dt.datetime.now(dt.timezone.utc)
-            session.add(row)
-        await session.commit()
+        # Первое сохранение из двух вкладок сразу: обе вставляют одну и ту же строку настроек.
+        # Проигравшая попытка откатывается и повторяется — уже как обновление существующей строки.
+        for attempt in range(3):
+            try:
+                for key, value in values.items():
+                    if key not in SETTING_KEYS:
+                        continue
+                    row = await session.get(AppSetting, key) or AppSetting(key=key)
+                    row.value = value
+                    row.updated_at = dt.datetime.now(dt.timezone.utc)
+                    session.add(row)
+                await session.commit()
+                return
+            except IntegrityError:
+                await session.rollback()
+                if attempt == 2:
+                    raise
+
+    async def tracking_domain_url(self, session: AsyncSession) -> str:
+        """Адрес трекинг-домена для ссылок кампаний: настройка из интерфейса, иначе из .env.
+
+        В сеть не ходит — в отличие от `resolve_defaults`, которому нужны справочники Keitaro:
+        кампания из базы должна открываться и при недоступном трекере.
+        """
+        overrides = await self.get_overrides(session)
+        value = overrides.get("tracking_domain_url") or self._settings.tracking_domain_url
+        return str(value or "").rstrip("/")
 
     async def resolve_defaults(self, session: AsyncSession) -> dict[str, Any]:
         """Итоговые значения по умолчанию + откуда каждое взялось (для показа в интерфейсе)."""

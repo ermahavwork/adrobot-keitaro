@@ -28,7 +28,7 @@ class TestHappyPath:
         campaign = only_campaign(fake)
         assert campaign["name"] == "Test AU"
         assert (campaign["domain_id"], campaign["group_id"], campaign["traffic_source_id"]) == \
-            (4622, 4970, 473), "домен, группа и источник проставлены"
+            (11, 22, 33), "домен, группа и источник проставлены"
         assert campaign["type"] == "position" and campaign["cost_type"] == "CPC"
         assert campaign["parameters"]["creative_id"]["name"] == "utm_creative", \
             "параметры источника скопированы в кампанию (API сам этого не делает)"
@@ -128,7 +128,7 @@ class TestValidationBeforeNetwork:
         fake.seed_campaign("existing")
         fake.domains_visible = False
         result = create(client)["results"][0]
-        assert fake.campaigns[result["keitaro_campaign_id"]]["domain_id"] == 4622
+        assert fake.campaigns[result["keitaro_campaign_id"]]["domain_id"] == 11
         assert any("не виден справочник доменов" in w for w in result["warnings"])
 
 

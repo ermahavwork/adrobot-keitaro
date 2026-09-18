@@ -223,6 +223,16 @@ class IdempotencyRecord(Base):
     created_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, default=utcnow)
 
 
+class CampaignLock(Base):
+    """Замок на кампанию между процессами (см. `services/locks.py`). Строка = «занято»."""
+
+    __tablename__ = "campaign_locks"
+
+    campaign_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    owner: Mapped[str] = mapped_column(String(32))
+    expires_at: Mapped[dt.datetime] = mapped_column(UTCDateTime, index=True)
+
+
 class AppSetting(Base):
     """Настройки, которые меняются из интерфейса (значения по умолчанию «создаватора»)."""
 

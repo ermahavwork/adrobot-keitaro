@@ -133,7 +133,8 @@ async def push(stream_id: int, session: SessionDep, client: ClientDep,
         async with audited(session, "push", **_ids(stream)) as info:
             info["details"] = {"diff": editor.stream_diff(stream), "force": body.force}
             result = await editor.push(session, client, dictionaries, stream,
-                                       force=body.force, allow_empty=body.allow_empty)
+                                       force=body.force, allow_empty=body.allow_empty,
+                                       allow_unknown_offers=body.allow_unknown_offers)
             info["details"]["published"] = result["offers"]
             info["summary"] = (f"поток «{stream.name}»: опубликовано офферов "
                                f"{len(result['offers'])}" + (" (принудительно)" if body.force else ""))

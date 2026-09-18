@@ -431,7 +431,7 @@ class TestArchive:
 def fill_campaigns(fake: FakeKeitaro, amount: int) -> None:
     for index in range(1, amount + 1):
         fake.campaigns[index] = {"id": index, "name": f"bulk {index}", "alias": f"bulk{index}",
-                                 "state": "active", "domain_id": 4622}
+                                 "state": "active", "domain_id": 11}
 
 
 def with_query_log(fake: FakeKeitaro) -> tuple[httpx.MockTransport, list[dict[str, str]]]:
@@ -493,11 +493,8 @@ class TestCampaignPages:
         body = [{"id": 1, "name": "ok"}, {"id": "2", "name": "string id"}, {"name": "no id"}]
         assert run(always(200, body=body), lambda c: c.list_campaigns()) == [{"id": 1, "name": "ok"}]
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "app/keitaro/client.py:list_campaigns — если трекер игнорирует limit/offset (комментарий "
-        "в коде сам допускает такие версии) и кампаний ровно 500, клиент делает 100 одинаковых "
-        "запросов (_MAX_PAGES). Нужен выход из цикла, когда страница не принесла новых id."))
     def test_tracker_ignoring_paging_with_exactly_500_campaigns_is_not_hammered(self):
+        # Регрессия: раньше клиент делал все 100 страниц (_MAX_PAGES) одинаковых запросов.
         page = [{"id": i, "name": f"c{i}"} for i in range(1, 501)]
         calls: list[httpx.Request] = []
 
@@ -506,7 +503,18 @@ class TestCampaignPages:
             return httpx.Response(200, json=page)
 
         assert len(run(handler, lambda c: c.list_campaigns())) == 500
-        assert len(calls) <= 2
+        assert len(calls) == 2, "вторая страница не принесла новых кампаний — дальше не идём"
+
+    def test_tracker_ignoring_offset_but_honouring_limit_stops_too(self):
+        calls: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            limit = int(request.url.params["limit"])
+            return httpx.Response(200, json=[{"id": i, "name": f"c{i}"} for i in range(1, limit + 1)])
+
+        assert len(run(handler, lambda c: c.list_campaigns())) == 500
+        assert len(calls) == 2
 
 
 def leak_scenarios() -> list[Any]:
@@ -546,18 +554,28 @@ class TestKeyNeverLeaks:
 
         assert LONG_KEY not in run(always(200, body=[]), action, api_key=LONG_KEY)
 
-    @pytest.mark.xfail(strict=True, reason=(
-        "app/keitaro/client.py:_error_from_response — текст ответа трекера вставляется в "
-        "сообщение как есть. Если прокси/отладочная страница перед Keitaro вернёт в теле "
-        "заголовки запроса, ключ уйдёт во фронтенд и в журнал операций (колонка error). "
-        "Docstring модуля обещает, что ключ в тексты ошибок не попадает: перед сборкой "
-        "сообщения вырезать api_key из upstream-текста."))
     @pytest.mark.parametrize(("status", "body"), [
         (403, {"error": f"Invalid Api-Key {LONG_KEY}"}),
         (404, f"No route. Request headers: Api-Key: {LONG_KEY}"),
         (422, {"error": f"debug dump: {LONG_KEY}"}),
+        (422, {"alias": [f"bad request, key was {LONG_KEY}"], LONG_KEY: ["echoed as a field name"]}),
+        (418, {"error": f"teapot saw {LONG_KEY}"}),
     ])
-    def test_key_echoed_by_upstream_is_cut_out_of_the_message(self, status, body):
+    def test_key_echoed_by_upstream_is_cut_out_of_the_error(self, status, body):
+        # Прокси или отладочная страница перед трекером могут вернуть заголовки запроса в теле.
         with pytest.raises(KeitaroError) as caught:
             run(always(status, body=body), offers, api_key=LONG_KEY)
-        assert LONG_KEY not in caught.value.message
+        error = caught.value
+        for text in (str(error), repr(error), error.message, json.dumps(error.to_dict())):
+            assert LONG_KEY not in text
+        assert "***" in error.message or "***" in json.dumps(error.details)
+
+    def test_key_echoed_during_retries_is_cut_out_too(self):
+        with pytest.raises(KeitaroError) as caught:
+            run(always(429, body={"error": f"slow down, {LONG_KEY}"}), offers, api_key=LONG_KEY)
+        assert LONG_KEY not in str(caught.value)
+
+    def test_very_short_key_does_not_shred_error_texts(self):
+        with pytest.raises(KeitaroNotFoundError) as caught:
+            run(always(404, body="Campaign #5 not found"), offers, api_key="o")
+        assert "Campaign #5 not found" in caught.value.message
